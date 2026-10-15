@@ -1,0 +1,32 @@
+{
+  "source_repository": "https://github.com/ivmreg/ha-event-vision",
+  "source_commit": "8900e17946a3096e132cdecb7b43a8964df4e660",
+  "source_dirty": false,
+  "domain": "event_vision",
+  "version": "0.2.0",
+  "files": {
+    "LICENSE": "bbc18a253c048d1a0ea03f4fbe8df1b8b22cb1c80a90093673f643707da3fb5b",
+    "README.md": "d7bc51a73a9ef50517ad3e3916ff78a0fd75eb23314918bbec8df70e3166fac9",
+    "custom_components/event_vision/__init__.py": "8c3291a5f36e3961f1bc920682fa0d516431d2b869b741691989085b13df1424",
+    "custom_components/event_vision/config_flow.py": "4aee249da6c07ba94fc7535ccbe0996f5cf2be9941281fd2b5f6b582abd852d5",
+    "custom_components/event_vision/const.py": "e95f82dd213d76cc295a63b6b6c5bef72cc1106918d1c1665e8ff7039f7f44c3",
+    "custom_components/event_vision/core/__init__.py": "24430f29225f246d08b4cc4bd3ebc84aff5b5cc22a7c354651774db9db922109",
+    "custom_components/event_vision/core/analysis.py": "55c3e64e3af935d6c91c9f44410aaf48e240b7fea25d75005005c8460d0c8a2c",
+    "custom_components/event_vision/core/extractor.py": "735b60cb0f903ae1618a492266e7929314cff7d6ddfb8333cb262018e804ed58",
+    "custom_components/event_vision/core/gemini.py": "db83d25f54f5740256acd47722c375358b5972b0922fd869b6eab7b56d446a71",
+    "custom_components/event_vision/core/models.py": "287b41877f40d8c3cff952f85c313c1a3e81f032f3b4b021ec938a2193d31d0f",
+    "custom_components/event_vision/core/store.py": "116db4ffbffbb1fe096a0b63fe8bb6c4ad68ac86fa3cb5b1f993096ecaafe3f8",
+    "custom_components/event_vision/core/worker.py": "64f6d6a5b37b894aa32463435a44031fa2fb51218abf5d2b73cca37df6fc9f72",
+    "custom_components/event_vision/diagnostics.py": "d61e9f06de2508abe22641726484758d74062ff80776c722f5569f48811bed9d",
+    "custom_components/event_vision/manifest.json": "7f1cb00d8a0fa1a835d60635454ff95253e5308d1f2c71cca40f570d5fb52482",
+    "custom_components/event_vision/sensor.py": "0df17fe26512eb6859374737e75e1316372d29b66b18696f34bf28fafd9052cd",
+    "custom_components/event_vision/services.py": "c975dff2feedf00b0074ff717a2a5eec321ee11a2074b7699c079d32500a52d9",
+    "custom_components/event_vision/services.yaml": "67a2f6d5f9c86f8c32fd8dd1af8000d3750a189fea1b356a2d21b25a7938a30d",
+    "custom_components/event_vision/strings.json": "0328a5a296601aa4d0e2228c549c093dde4e1d6389566fc00580c6153b1197a6",
+    "custom_components/event_vision/translations/en.json": "0328a5a296601aa4d0e2228c549c093dde4e1d6389566fc00580c6153b1197a6",
+    "docs/hacs.md": "edc3784eeeacab1953ff97523792bd475ac3e607092f4fe6a0c93d846d5f82bc",
+    "docs/install.md": "1ec760fb2e9827135bc32cf5ca778e7944ddf1d77b713819696756a37ee64251",
+    "docs/recording-ha-api.md": "dc38450dd8ba65267b9510a465d2dea82ea891dd7452babc6df7f12eec9bb7e2",
+    "hacs.json": "91b8b89651d19dfd0e3f802f9b1b19b9b57fa1664ea1bd88b036d45c41ec32a2"
+  }
+}

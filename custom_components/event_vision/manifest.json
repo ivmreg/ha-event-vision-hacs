@@ -1,0 +1,12 @@
+{
+  "domain": "event_vision",
+  "name": "Event Vision",
+  "codeowners": ["@ivmreg"],
+  "config_flow": true,
+  "documentation": "https://github.com/ivmreg/ha-event-vision",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/ivmreg/ha-event-vision/issues",
+  "dependencies": ["event_recording"],
+  "requirements": ["Pillow==12.3.0"],
+  "version": "0.2.0"
+}

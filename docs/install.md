@@ -1,0 +1,169 @@
+# Installation & Setup Guide
+
+This guide walks through installing and configuring `event_recording` (standalone core) and `event_vision` (optional AI consumer) on Home Assistant 2026.10.1.
+
+---
+
+## 1. Overview & Installation Method
+
+HACS requires one integration per repository. Add `ivmreg/ha-event-recording`
+and, optionally, `ivmreg/ha-event-vision-hacs` as custom repositories with type
+**Integration**. Download Event Recording first, then Event Vision, and restart
+Home Assistant. Continue with the configuration steps below, skipping the manual
+copy steps. The recording integration includes the timeline card.
+
+The development repository contains both components and is not itself a HACS
+repository. Distribution repositories must be public for standard HACS; private
+staging mirrors cannot be installed. See [HACS packaging](hacs.md) for details.
+Manual copy into `custom_components/` remains supported.
+
+| Component | Role | Required Dependencies | Cloud / API Key |
+|---|---|---|---|
+| **`event_recording`** | Standalone event journal, media store, streaming, card | None (works standalone) | None (100% local) |
+| **`event_vision`** | Optional AI incident analyzer | `event_recording` | Google Gemini API key |
+
+---
+
+## 2. Step 1: Install `event_recording` (Standalone Core)
+
+1. Copy the `custom_components/event_recording` directory into your Home Assistant configuration directory:
+   ```
+   <ha_config_dir>/custom_components/event_recording/
+   ```
+2. Restart Home Assistant to allow the integration to be discovered.
+3. In Home Assistant, navigate to **Settings -> Devices & Services -> Add Integration**.
+4. Search for and select **Event Recording**.
+5. Configure the integration options:
+   - **Media Root:** Private subdirectory of the Home Assistant configuration directory (default: `event_recording_media`).
+   - **Retention Size Budget:** Maximum storage quota in megabytes allocated to recordings before oldest unpinned media is unlinked (default: `2048` MB).
+   - **Retention Age Budget:** Maximum age in days before media files become eligible for pruning (default: `7` days).
+   - **Chunk Duration:** Base capture segment duration in seconds (default: `10`, maximum `15` seconds).
+6. Click **Submit**.
+
+> [!NOTE]
+> `event_recording` requires zero API keys and zero camera entities during setup. It is ready for logging and media ingestion immediately.
+
+---
+
+## Optional native camera recording
+
+Keep the owned media root outside `www` and outside every configured `media_dirs` directory so other media handlers cannot bypass event permissions. The default is `/config/event_recording_media` on Home Assistant OS.
+
+For the native camera adapter, add only that private directory to the existing `homeassistant` configuration (merge with your current settings):
+
+```yaml
+homeassistant:
+  allowlist_external_dirs:
+    - /config/event_recording_media
+```
+
+Validate configuration and restart after this manual change. Use your actual configuration path on other installations. The integration does not change the global allowlist. Event-only journaling and external media imports do not need this camera permission. FFmpeg and ffprobe must be available for validated video imports/capture; Home Assistant OS normally provides them.
+
+## 3. Step 2: Register the Lovelace Card Resource
+
+`event_recording` bundles a companion Lovelace card for viewing event timelines, playing Range-streamed video clips, and inspecting annotations.
+
+1. In Home Assistant, navigate to **Settings -> Dashboards -> Resources** (or menu dots in Lovelace UI -> Manage resources).
+2. Click **Add Resource**.
+3. Fill in the resource details:
+   - **URL:** `/event_recording/event-card.js`
+   - **Resource Type:** `JavaScript Module`
+4. Click **Create**.
+5. You can now add the card to any Lovelace view:
+   ```yaml
+   type: custom:event-recording-card
+   page_size: 25
+   ```
+
+---
+
+## 4. Step 3: Install `event_vision` (Optional AI Consumer)
+
+If you wish to enable multimodal AI event analysis via direct Google Gemini:
+
+1. Copy the `custom_components/event_vision` directory into your Home Assistant directory:
+   ```
+   <ha_config_dir>/custom_components/event_vision/
+   ```
+2. Restart Home Assistant.
+3. In Home Assistant, navigate to **Settings -> Devices & Services -> Add Integration**.
+4. Search for and select **Event Vision**.
+5. Provide your configuration:
+   - **Gemini API Key:** Your Google AI Studio API key.
+   - **Gemini Model:** Multimodal model ID (default: `gemini-flash-lite-latest`).
+6. Click **Submit**.
+
+> [!NOTE]
+> **Secret Storage Notice:** Home Assistant persists configuration entries on disk in `.storage/core.config_entries` as plaintext JSON. Keys are redacted in diagnostics and logging, but are not encrypted at rest by the Home Assistant platform.
+
+---
+
+## 5. Step 4: Configure Home Assistant Automations
+
+All event triggers are defined via native Home Assistant automations. Use `mode: queued` with `max: 100` to prevent drop-off during rapid successive triggers.
+
+### 5.1 Generic Event Logging (Without Camera)
+Log sensor transitions or system events directly into the durable journal:
+
+```yaml
+automation:
+  - alias: "Server Room High Temperature"
+    mode: queued
+    max: 100
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.server_room_temperature
+        above: 32.0
+    action:
+      - action: event_recording.log_event
+        data:
+          source_id: sensor.server_room_temperature
+          kind: high_temperature
+          label: "Server Room Above 32C"
+          payload:
+            current: "{{ states('sensor.server_room_temperature') }}"
+            alert_level: warning
+          access_entities:
+            - sensor.server_room_temperature
+```
+
+### 5.2 Trigger Recording with Native Camera Capture
+Capture video upon sensor trigger with lookback pre-roll and session coalescing:
+
+```yaml
+automation:
+  - alias: "Front Door Motion Recording"
+    mode: queued
+    max: 100
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.front_door_motion
+        to: "on"
+    action:
+      - action: event_recording.record
+        data:
+          source_id: binary_sensor.front_door_motion
+          kind: motion
+          resource_key: camera.front_door # Canonical camera entity ID
+          operation: start_or_extend
+          window_seconds: 15
+          lookback_seconds: 5
+          hold: false
+          recorder_config:
+            adapter: camera
+            camera_entity: camera.front_door
+          access_entities:
+            - camera.front_door
+            - binary_sensor.front_door_motion
+```
+
+### 5.3 Reference Blueprints & Templates
+- Door contact recording blueprint: [`blueprints/automation/event_recording/door_recording.yaml`](../blueprints/automation/event_recording/door_recording.yaml).
+- Event journal automation templates:
+  - [`examples/automations/ha_event_journal.yaml`](../examples/automations/ha_event_journal.yaml)
+  - [`examples/automations/mqtt_journal.yaml`](../examples/automations/mqtt_journal.yaml)
+  - [`examples/automations/numeric_state_journal.yaml`](../examples/automations/numeric_state_journal.yaml)
+
+### 5.4 Camera Prerequisites
+- **Preload Stream:** To capture lookback pre-roll (`lookback_seconds > 0`), the target camera must have **Preload stream** (`preload_stream: true`) enabled in its device/integration settings in Home Assistant. Cold or non-preloaded streams cannot supply pre-trigger footage.
+- **Single Recorder Rule:** Only one recording task should manage a given `resource_key` at a time. Do not configure competing automations or external recording integrations on the same camera stream.

@@ -1,0 +1,11 @@
+analyze:
+  name: Analyze Event
+  description: Trigger or retry AI vision analysis for a recorded event.
+  fields:
+    event_id:
+      name: Event ID
+      description: ID of the event to analyze.
+      required: true
+      example: "019273c5-7f28-7654-9a1b-cde012345678"
+      selector:
+        text: {}

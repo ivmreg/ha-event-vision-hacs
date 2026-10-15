@@ -1,0 +1,57 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configure Event Vision",
+        "description": "Set up optional Google Gemini AI incident analyzer for recorded events.",
+        "data": {
+          "gemini_api_key": "Gemini API Key",
+          "model": "Gemini Model",
+          "concurrency": "Concurrency (1-4)",
+          "auto_analyze": "Automatically Analyze Finalized Events",
+          "prompt_instructions": "Custom Prompt Instructions (optional)"
+        }
+      }
+    },
+    "error": {
+      "invalid_api_key": "Gemini API key is required and cannot be empty.",
+      "invalid_concurrency": "Concurrency must be between 1 and 4.",
+      "instructions_too_long": "Prompt instructions must not exceed 1000 characters."
+    },
+    "abort": {
+      "single_instance_allowed": "Only one Event Vision analyzer instance is allowed."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Event Vision Options",
+        "description": "Update model parameters, concurrency, and prompt instructions.",
+        "data": {
+          "gemini_api_key": "Gemini API Key (leave blank to keep existing)",
+          "model": "Gemini Model",
+          "concurrency": "Concurrency (1-4)",
+          "auto_analyze": "Automatically Analyze Finalized Events",
+          "prompt_instructions": "Custom Prompt Instructions (optional)"
+        }
+      }
+    },
+    "error": {
+      "invalid_concurrency": "Concurrency must be between 1 and 4.",
+      "instructions_too_long": "Prompt instructions must not exceed 1000 characters."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "queue_pending": {
+        "name": "Queue Pending"
+      }
+    }
+  },
+  "services": {
+    "analyze": {
+      "name": "Analyze Event",
+      "description": "Trigger or retry AI vision analysis for a recorded event."
+    }
+  }
+}
