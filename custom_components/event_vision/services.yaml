@@ -9,3 +9,15 @@ analyze:
       example: "019273c5-7f28-7654-9a1b-cde012345678"
       selector:
         text: {}
+
+analyze_incident:
+  name: Analyze Incident
+  description: Trigger or retry AI multi-camera visual fusion analysis for an incident.
+  fields:
+    incident_id:
+      name: Incident ID
+      description: ID of the incident to analyze.
+      required: true
+      example: "inc_019273c5_7f28"
+      selector:
+        text: {}

@@ -43,6 +43,27 @@ Manual copy into `custom_components/` remains supported.
 > [!NOTE]
 > `event_recording` requires zero API keys and zero camera entities during setup. It is ready for logging and media ingestion immediately.
 
+### Configure camera profiles later
+
+After setup, open **Settings -> Devices & Services -> Event Recording -> Configure** to add, edit, or remove camera profiles under **Cameras**. Each profile selects an existing Home Assistant `camera` entity and sets its `source_id`, `label`, `window_seconds` (1–300), `lookback_seconds` (0–60), `chunk_seconds` (1–15), and `max_window_seconds` (1–300; at least `window_seconds`). Camera credentials and connection settings remain with the camera's existing Home Assistant integration.
+
+Profiles are optional and stored under `entry.options.camera_profiles`, keyed by camera entity ID. Adding or editing a profile sets defaults for future recording sessions; it does not interrupt or reconfigure an active episode. Removing a profile removes only its settings and leaves recordings intact. The `camera_entity` shortcut on `event_recording.record` requires a configured profile. Existing automations that pass `resource_key` and `recorder_config` remain supported.
+
+For example, a profile can supply source and timing defaults while an automation overrides only the window and lookback for one call:
+
+```yaml
+action: event_recording.record
+data:
+  camera_entity: camera.example_entry
+  kind: motion
+  operation: start_or_extend
+  source_id: entryway       # Optional per-call override
+  window_seconds: 20        # Optional; otherwise use the profile
+  lookback_seconds: 5       # Optional; otherwise use the profile
+```
+
+The shortcut uses the selected camera as the canonical `resource_key`; `kind` and `operation` are still required. Omit per-call profile fields to use the saved values. Lookback depends on the camera's stream buffering or preload settings in Home Assistant; a configured lookback does not guarantee pre-trigger footage.
+
 ---
 
 ## Optional native camera recording
@@ -127,8 +148,8 @@ automation:
             - sensor.server_room_temperature
 ```
 
-### 5.2 Trigger Recording with Native Camera Capture
-Capture video upon sensor trigger with lookback pre-roll and session coalescing:
+### 5.2 Trigger Recording with a Camera Profile
+Capture video from a configured camera profile. Its source and timing defaults apply unless the action supplies an override:
 
 ```yaml
 automation:
@@ -137,24 +158,20 @@ automation:
     max: 100
     trigger:
       - platform: state
-        entity_id: binary_sensor.front_door_motion
+        entity_id: binary_sensor.example_motion
         to: "on"
     action:
       - action: event_recording.record
         data:
-          source_id: binary_sensor.front_door_motion
+          camera_entity: camera.example_entry
           kind: motion
-          resource_key: camera.front_door # Canonical camera entity ID
           operation: start_or_extend
-          window_seconds: 15
-          lookback_seconds: 5
-          hold: false
-          recorder_config:
-            adapter: camera
-            camera_entity: camera.front_door
+          source_id: entryway       # Optional override of profile source
+          window_seconds: 15        # Optional override of profile default
+          lookback_seconds: 5       # Optional override of profile default
           access_entities:
-            - camera.front_door
-            - binary_sensor.front_door_motion
+            - camera.example_entry
+            - binary_sensor.example_motion
 ```
 
 ### 5.3 Reference Blueprints & Templates
@@ -165,5 +182,5 @@ automation:
   - [`examples/automations/numeric_state_journal.yaml`](../examples/automations/numeric_state_journal.yaml)
 
 ### 5.4 Camera Prerequisites
-- **Preload Stream:** To capture lookback pre-roll (`lookback_seconds > 0`), the target camera must have **Preload stream** (`preload_stream: true`) enabled in its device/integration settings in Home Assistant. Cold or non-preloaded streams cannot supply pre-trigger footage.
+- **Lookback Buffering:** Lookback pre-roll depends on stream buffering or preload settings in Home Assistant. Cold or non-preloaded streams may not supply pre-trigger footage; setting a lookback duration does not guarantee it.
 - **Single Recorder Rule:** Only one recording task should manage a given `resource_key` at a time. Do not configure competing automations or external recording integrations on the same camera stream.

@@ -8,15 +8,17 @@
           "gemini_api_key": "Gemini API Key",
           "model": "Gemini Model",
           "concurrency": "Concurrency (1-4)",
-          "auto_analyze": "Automatically Analyze Finalized Events",
-          "prompt_instructions": "Custom Prompt Instructions (optional)"
+          "auto_analyze": "Automatically Analyze Finalized Events"
         }
       }
     },
     "error": {
       "invalid_api_key": "Gemini API key is required and cannot be empty.",
       "invalid_concurrency": "Concurrency must be between 1 and 4.",
-      "instructions_too_long": "Prompt instructions must not exceed 1000 characters."
+      "instructions_too_long": "Prompt instructions must not exceed 1000 characters.",
+      "invalid_max_frames": "Frame sampling budget must be between 3 and 16 frames.",
+      "invalid_sampling_policy": "Selected sampling policy is invalid.",
+      "budget_deadline_too_short": "Job deadline is too short for selected frame budget, extraction timeout, and provider timeout."
     },
     "abort": {
       "single_instance_allowed": "Only one Event Vision analyzer instance is allowed."
@@ -26,19 +28,72 @@
     "step": {
       "init": {
         "title": "Event Vision Options",
-        "description": "Update model parameters, concurrency, and prompt instructions.",
+        "description": "Select a category to view or update settings.\n\nKnown Limitations:\n- Multi-camera visual fusion is experimental, disabled by default, and can issue additional Gemini requests with associated cost. It has not been live-tested on this Home Assistant installation.\n- Cross-view correspondences are uncertain hypotheses, not identity proofs.\n- Cloud responses do not block intake or capture; active analysis pins intentionally defer retention.\n- Extracted frame UTC may remain unknown without verified camera clocks.",
+        "menu_options": {
+          "general": "General (API Key, Model, Concurrency)",
+          "sampling": "Sampling (Budget, Policy, Instructions)",
+          "fusion": "Multi-Camera Fusion (Enable, Frame Budget, Instructions)",
+          "advanced": "Advanced (Timeouts, Attempts, Deadlines)",
+          "effective": "Effective Configuration (Read-only status)"
+        }
+      },
+      "general": {
+        "title": "General Settings",
+        "description": "Configure model, concurrency, and optional API key update.",
         "data": {
-          "gemini_api_key": "Gemini API Key (leave blank to keep existing)",
+          "gemini_api_key": "Gemini API Key (leave blank to keep existing key)",
           "model": "Gemini Model",
           "concurrency": "Concurrency (1-4)",
-          "auto_analyze": "Automatically Analyze Finalized Events",
+          "auto_analyze": "Automatically Analyze Finalized Events"
+        }
+      },
+      "sampling": {
+        "title": "Sampling Settings",
+        "description": "Configure frame extraction budget, policy, and prompt instructions.",
+        "data": {
+          "max_frames": "Frame Sampling Budget (3-16)",
+          "sampling_policy": "Sampling Policy",
           "prompt_instructions": "Custom Prompt Instructions (optional)"
         }
+      },
+      "fusion": {
+        "title": "Multi-Camera Visual Fusion",
+        "description": "Configure multi-camera visual fusion analysis across incident events.",
+        "data": {
+          "enable_fusion": "Enable Multi-Camera Visual Fusion",
+          "fusion_max_frames": "Fusion Frame Budget (2-16)",
+          "fusion_prompt_instructions": "Custom Fusion Instructions (optional)",
+          "fusion_job_deadline": "Fusion Job Deadline (seconds)"
+        }
+      },
+      "advanced": {
+        "title": "Advanced Settings",
+        "description": "Configure coupled execution deadlines, extraction timeouts, and attempt limits.",
+        "data": {
+          "job_deadline": "Job Deadline (seconds)",
+          "provider_timeout": "Provider Timeout (seconds)",
+          "extraction_timeout": "Extraction Timeout (seconds)",
+          "max_attempts": "Maximum Attempts (1-5)"
+        }
+      },
+      "effective": {
+        "title": "Effective Configuration",
+        "description": "**Model:** {model_name}\n*{model_alias_fact}*\n\n**Base Prompt:**\n{base_prompt}\n\n**Custom Instructions:**\n{custom_instructions}\n\n**Effective Prompt:**\n{effective_prompt}\n\n**Input Limits:** {input_limits}\n\n**Budget Requirements:** {budget_requirements}\n\n**Policy Scope:** {policy_scope}\n\n**Multi-Camera Fusion:**\n{fusion_summary}\n\n**Known Limitations:**\n- Experimental visual fusion is off by default and can incur additional external API costs; not live-tested here\n- Cross-view correspondences are uncertain hypotheses with frame references, not identity proofs\n- Cloud responses do not block intake or capture; active analysis pins defer retention\n- Visual UTC timestamps depend on provider clock calibration and may remain unknown"
       }
     },
     "error": {
+      "invalid_model": "Model name cannot be empty.",
       "invalid_concurrency": "Concurrency must be between 1 and 4.",
-      "instructions_too_long": "Prompt instructions must not exceed 1000 characters."
+      "instructions_too_long": "Prompt instructions must not exceed 1000 characters.",
+      "invalid_max_frames": "Frame sampling budget must be between 3 and 16 frames.",
+      "invalid_sampling_policy": "Selected sampling policy is invalid.",
+      "budget_deadline_too_short": "Job deadline is too short for selected frame budget, extraction timeout, and provider timeout.",
+      "invalid_fusion_max_frames": "Fusion frame budget must be between 2 and 16 frames.",
+      "invalid_fusion_deadline": "Fusion job deadline must be between 60 and 600 seconds.",
+      "invalid_job_deadline": "Job deadline must be between 60 and 600 seconds.",
+      "invalid_provider_timeout": "Provider timeout must be between 10 and 180 seconds.",
+      "invalid_extraction_timeout": "Extraction timeout must be between 2 and 30 seconds.",
+      "invalid_max_attempts": "Maximum attempts must be a whole number between 1 and 5."
     }
   },
   "entity": {
@@ -52,6 +107,10 @@
     "analyze": {
       "name": "Analyze Event",
       "description": "Trigger or retry AI vision analysis for a recorded event."
+    },
+    "analyze_incident": {
+      "name": "Analyze Incident",
+      "description": "Trigger or retry AI multi-camera visual fusion analysis for an incident."
     }
   }
 }

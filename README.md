@@ -2,7 +2,7 @@
 
 Optional direct Gemini analysis of finalized Event Recording events. Its durable queue is separate from recording. Cloud failures and analysis retries do not block event intake or capture. This integration has no LLMVision dependency.
 
-Requires Home Assistant **2026.10.1** or later. Version **0.2.0**.
+Requires Home Assistant **2026.10.1** or later. Version **0.3.0**.
 
 ## HACS custom repository
 
@@ -23,5 +23,9 @@ HACS requires public GitHub repositories; a private staging mirror is not instal
 Removing or disabling this optional analyzer leaves the event journal and recording pipeline available.
 
 See [the installation guide](docs/install.md) for configuration and automation examples.
+
+## Known Limitations
+
+Concrete operational limitations and architectural boundaries are documented in `custom_components/event_vision/KNOWN_ISSUES.md` and visible in the installed integration Options screen.
 
 This distribution is generated from the source identified in `SOURCE.json`. It contains one integration only; local recordings, API keys, and Home Assistant configuration are not part of the package.

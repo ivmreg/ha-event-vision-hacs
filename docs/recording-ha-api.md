@@ -22,7 +22,7 @@ The `event_recording` integration is a pure, neutral, high-performance event jou
   - `retention_size_mb`: Soft maximum storage budget in MB (default: `2048`).
   - `retention_days`: Maximum age before media deletion (default: `7`).
   - `chunk_seconds`: Recording chunk duration in seconds (default: `10`, maximum `15`).
-- **Options Flow:** Allows non-disruptive reconfiguration of retention size, retention age, and chunk duration.
+- **Options Flow:** Allows non-disruptive reconfiguration of retention size, retention age, and default chunk duration. Its **Cameras** section can add, edit, and remove optional per-camera profiles. Profiles live under `entry.options.camera_profiles`, keyed by camera entity ID; setup remains independent of cameras. They store `source_id`, `label`, `window_seconds` (1–300), `lookback_seconds` (0–60), `chunk_seconds` (1–15), and `max_window_seconds` (1–300, at least `window_seconds`). The camera selector uses existing Home Assistant camera entities; credentials and connection settings stay with their existing integrations. Profile changes apply to future sessions and do not alter active episodes. Removing a profile removes its settings only and retains recordings.
 - **Camera Recorder Adapter Prerequisite (`allowlist_external_dirs`):**
   - Recording with the optional native `camera` adapter invokes `camera.record`, which requires that the target storage directory is explicitly configured in Home Assistant's `allowlist_external_dirs` in `configuration.yaml` (e.g. `/config/event_recording_media`).
   - The adapter preflights this check via `hass.config.is_allowed_path` and fails closed with `MEDIA_ROOT_NOT_ALLOWED` if unlisted.
@@ -96,23 +96,46 @@ response_variable: log_result
 
 ### `event_recording.record`
 Queues a durable recording intent. Positive acceptance ACK occurs immediately upon SQLite intent write; camera capture proceeds asynchronously.
+
+For a configured camera profile, use the `camera_entity` shortcut. The profile supplies `source_id`, `label`, and timing defaults; `chunk_seconds` and `max_window_seconds` are profile-only settings. The camera entity supplies the canonical `resource_key` and camera adapter configuration. `kind` and `operation` remain required. Explicit per-call `source_id`, `label`, `window_seconds`, and `lookback_seconds` values override their saved defaults:
+
 ```yaml
 action: event_recording.record
 data:
-  source_id: binary_sensor.front_door_contact
+  camera_entity: camera.example_entry
+  kind: motion
+  operation: start_or_extend
+  source_id: entryway          # Optional override
+  label: Entryway activity     # Optional override
+  window_seconds: 20           # Optional override; 1 to 300
+  lookback_seconds: 5          # Optional override; 0 to 60
+```
+
+Set `chunk_seconds` and `max_window_seconds` on the camera profile in **Options -> Cameras**. `max_window_seconds` must be at least the profile's `window_seconds`.
+
+Lookback relies on Home Assistant stream buffering/preload for the selected camera. The setting cannot guarantee that pre-trigger footage is available.
+
+The original explicit `resource_key` and `recorder_config` form remains supported for existing automations:
+
+```yaml
+action: event_recording.record
+data:
+  source_id: entryway
   kind: contact_open
-  resource_key: camera.front_door # Must match canonical camera_entity if adapter=camera
+  resource_key: camera.example_entry # Must match camera_entity for the camera adapter
   operation: start_or_extend     # 'start_or_extend' or 'end_after'
   window_seconds: 15             # 1 to 300
   lookback_seconds: 5            # 0 to 60 (used on initial capture chunk)
   hold: true                     # Keep active until explicit end_after or max 300s
   recorder_config:
     adapter: camera
-    camera_entity: camera.front_door
+    camera_entity: camera.example_entry
   idempotency_key: "{{ context.id }}"
 response_variable: record_result
 # Returns: {"event_id": "ev_...", "inserted": true, "intent_id": "intent_..."}
 ```
+
+In either form, the camera media root must remain in Home Assistant's private media allowlist as described above. Camera profiles do not add credentials, YAML, or a bypass around this requirement.
 
 ### `event_recording.attach_media`
 Atomically validates and attaches an external video or image file to an event. Restricted to **Admin and System Automation callers** to prevent arbitrary filesystem attachment by untrusted human users.
@@ -151,7 +174,13 @@ List events with keyset pagination and server-side security filtering. Cursor st
   "source_id": "binary_sensor.front_door_contact",
   "kind": "contact_open",
   "limit": 20,
-  "before_cursor": "..."
+  "before_cursor": "...",
+  "exclude_current_complete_annotation": {
+    "namespace": "event_vision",
+    "field": "activity",
+    "equals": false
+  },
+  "exclude_journal_only": true
 }
 
 // Response
@@ -206,6 +235,8 @@ List events with keyset pagination and server-side security filtering. Cursor st
   }
 }
 ```
+
+Both exclusion fields are optional. The annotation filter matches a top-level JSON scalar in a complete annotation for the current media revision. Namespace and field are caller supplied; booleans remain distinct from numbers, integer and real numbers compare numerically, and a missing field does not match JSON `null`. `exclude_journal_only` hides ready/expired events with no media and no capture error. Both filters apply before the page limit; the cursor advances through matching events.
 
 ### `event_recording/event`
 Get a single event by ID.

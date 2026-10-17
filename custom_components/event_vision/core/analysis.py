@@ -13,7 +13,13 @@ from .models import (
     FrameExtractionError,
     GeminiKeyError,
     GeminiSchemaError,
+    compute_profile_digest,
+    derive_lease_pin_seconds,
+    derive_reservation_ttl,
+    is_rolling_model_alias,
+    validate_budget_bounds,
 )
+from .sampling import PlannedAnchor, plan_event_sampling
 from .store import AnalysisJobStore
 from .worker import AnalysisWorker, VisionCoordinator
 
@@ -31,6 +37,13 @@ __all__ = [
     "GeminiClient",
     "GeminiKeyError",
     "GeminiSchemaError",
+    "PlannedAnchor",
     "VisionCoordinator",
+    "compute_profile_digest",
+    "derive_lease_pin_seconds",
+    "derive_reservation_ttl",
+    "is_rolling_model_alias",
+    "plan_event_sampling",
+    "validate_budget_bounds",
     "validate_image_bytes",
 ]

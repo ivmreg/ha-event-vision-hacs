@@ -4,7 +4,7 @@ Features:
 - Pure Python (zero Home Assistant dependencies)
 - Image input: Validates JPEG (SOI, SOF frame dimensions, EOI) and PNG (IHDR dimensions, IEND)
 - Bounds enforcement: max 10MB source bytes, max 4096px width/height
-- Video input: Samples up to 6 chronological frames using ffmpeg subprocess
+- Video input: Samples up to 16 chronological frames using ffmpeg subprocess
 - Robust subprocess reaping on timeout or cancellation (zero zombie processes, re-raises CancelledError)
 - Generic: No assumptions about physical source, camera type, or event kind
 """
@@ -17,7 +17,9 @@ import shutil
 from pathlib import Path
 
 from ..const import (
-    MAX_FRAMES,
+    DEFAULT_EXTRACTION_TIMEOUT,
+    DEFAULT_MAX_FRAMES,
+    MAX_FRAMES_BUDGET,
     MAX_IMAGE_DIMENSION,
     MAX_IMAGE_SOURCE_BYTES,
 )
@@ -86,16 +88,21 @@ class FrameExtractor:
         kind: str | None = None,
         mime_type: str | None = None,
         duration: float | None = None,
-        max_frames: int = MAX_FRAMES,
+        max_frames: int = DEFAULT_MAX_FRAMES,
+        timestamps: list[float] | None = None,
+        timeout_seconds: float = DEFAULT_EXTRACTION_TIMEOUT,
+        media_id: str | None = None,
+        timestamp_quality: str = "unknown",
+        offset_quality: str = "exact",
     ) -> list[ExtractedFrame]:
         """Extract validated frames from an existing media file path.
 
-        Bounded to max_frames <= 6.
+        Bounded to max_frames <= 16.
         """
         if not await asyncio.to_thread(media_path.is_file):
             raise FrameExtractionError("MEDIA_UNAVAILABLE", f"Media file not found: {media_path.name}")
 
-        max_frames = max(1, min(max_frames, MAX_FRAMES))
+        max_frames = max(1, min(max_frames, MAX_FRAMES_BUDGET))
 
         # Determine if media is an image
         is_image = False
@@ -110,12 +117,32 @@ class FrameExtractor:
             size = await asyncio.to_thread(media_path.stat)
             if size.st_size > MAX_IMAGE_SOURCE_BYTES:
                 raise FrameExtractionError("IMAGE_TOO_LARGE", "Image source exceeds byte limit")
-            return await self._extract_image(media_path)
+            return await self._extract_image(
+                media_path,
+                media_id=media_id,
+                timestamp_quality=timestamp_quality,
+                offset_quality=offset_quality,
+            )
 
         # Video frame extraction
-        return await self._extract_video_frames(media_path, duration=duration, max_frames=max_frames)
+        return await self._extract_video_frames(
+            media_path,
+            duration=duration,
+            max_frames=max_frames,
+            timestamps=timestamps,
+            timeout_seconds=timeout_seconds,
+            media_id=media_id,
+            timestamp_quality=timestamp_quality,
+            offset_quality=offset_quality,
+        )
 
-    async def _extract_image(self, media_path: Path) -> list[ExtractedFrame]:
+    async def _extract_image(
+        self,
+        media_path: Path,
+        media_id: str | None = None,
+        timestamp_quality: str = "unknown",
+        offset_quality: str = "exact",
+    ) -> list[ExtractedFrame]:
         """Read and validate image file bytes."""
         try:
             raw_bytes = await asyncio.to_thread(media_path.read_bytes)
@@ -123,26 +150,55 @@ class FrameExtractor:
             raise FrameExtractionError("MEDIA_UNAVAILABLE", f"Cannot read media file: {err}") from err
 
         detected_mime = await asyncio.to_thread(validate_image_bytes, raw_bytes)
-        return [ExtractedFrame(data=raw_bytes, mime_type=detected_mime)]
+        return [
+            ExtractedFrame(
+                data=raw_bytes,
+                mime_type=detected_mime,
+                media_id=media_id,
+                offset_seconds=0.0,
+                timestamp_quality=timestamp_quality,
+                offset_quality=offset_quality,
+            )
+        ]
 
     async def _extract_video_frames(
         self,
         media_path: Path,
         duration: float | None = None,
-        max_frames: int = MAX_FRAMES,
+        max_frames: int = DEFAULT_MAX_FRAMES,
+        timestamps: list[float] | None = None,
+        timeout_seconds: float = DEFAULT_EXTRACTION_TIMEOUT,
+        media_id: str | None = None,
+        timestamp_quality: str = "unknown",
+        offset_quality: str = "exact",
     ) -> list[ExtractedFrame]:
         """Extract chronological frames from a video file using ffmpeg."""
         ffmpeg_exec = await asyncio.to_thread(self._resolve_ffmpeg)
         if not ffmpeg_exec:
             raise FrameExtractionError("FFMPEG_NOT_FOUND", "ffmpeg binary not found; failing closed")
 
-        timestamps = self._calculate_anchors(duration=duration, max_frames=max_frames)
+        if timestamps is not None:
+            ts_list = timestamps[:max_frames]
+        else:
+            ts_list = self._calculate_anchors(duration=duration, max_frames=max_frames)
+
         frames: list[ExtractedFrame] = []
 
-        for ts in timestamps:
-            frame_data = await self._run_ffmpeg_extract_frame(ffmpeg_exec, media_path, ts)
+        for ts in ts_list:
+            frame_data = await self._run_ffmpeg_extract_frame(
+                ffmpeg_exec, media_path, ts, timeout_seconds=timeout_seconds
+            )
             if frame_data:
-                frames.append(ExtractedFrame(data=frame_data, mime_type="image/jpeg"))
+                frames.append(
+                    ExtractedFrame(
+                        data=frame_data,
+                        mime_type="image/jpeg",
+                        media_id=media_id,
+                        offset_seconds=ts,
+                        timestamp_quality=timestamp_quality,
+                        offset_quality=offset_quality,
+                    )
+                )
 
         if not frames:
             raise FrameExtractionError("FRAME_EXTRACTION_FAILED", "Failed to extract any valid frames from video")
@@ -150,19 +206,22 @@ class FrameExtractor:
         return frames
 
     def _calculate_anchors(self, duration: float | None, max_frames: int) -> list[float]:
-        """Calculate chronological timestamps bounded <= 6 frames."""
+        """Calculate chronological timestamps bounded <= 16 frames."""
         dur = duration if duration and duration > 0 else 1.0
-        max_frames = min(max_frames, MAX_FRAMES)
+        max_frames = min(max_frames, MAX_FRAMES_BUDGET)
 
         if max_frames == 1:
             return [min(0.5, dur * 0.1)]
 
         step = dur / (max_frames + 1)
-        anchors = [round((i + 1) * step, 2) for i in range(max_frames)]
-        return anchors
+        return [round((i + 1) * step, 2) for i in range(max_frames)]
 
     async def _run_ffmpeg_extract_frame(
-        self, ffmpeg_exec: str, media_path: Path, timestamp: float
+        self,
+        ffmpeg_exec: str,
+        media_path: Path,
+        timestamp: float,
+        timeout_seconds: float = DEFAULT_EXTRACTION_TIMEOUT,
     ) -> bytes | None:
         """Run ffmpeg subprocess to extract one frame, strictly reaping on timeout/cancel."""
         cmd = [
@@ -189,31 +248,13 @@ class FrameExtractor:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
             if proc.returncode == 0 and stdout and stdout.startswith(JPEG_SOI):
                 return stdout
         except asyncio.CancelledError:
-            # Strictly reap child process and re-raise CancelledError
-            if proc:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                try:
-                    await proc.wait()
-                except Exception:
-                    pass
+            # Re-raise CancelledError; child process is reaped in finally
             raise
         except TimeoutError:
-            if proc:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                try:
-                    await proc.wait()
-                except Exception:
-                    pass
             _LOGGER.warning("FFmpeg frame extraction timed out at %ss", timestamp)
         except Exception as err:
             _LOGGER.warning("FFmpeg frame extraction process error: %s", err)

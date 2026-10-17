@@ -6,14 +6,47 @@ Strict boundary: Zero Home Assistant imports, zero camera/sensor dependencies.
 from __future__ import annotations
 
 import hashlib
+import json
+import math
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from custom_components.event_recording.core.models import (
+    compute_incident_input_token as compute_incident_input_token,
+)
+
 from ..const import (
+    CAS_CLEANUP_MARGIN_SECONDS,
+    DEFAULT_EXTRACTION_TIMEOUT,
+    DEFAULT_FUSION_JOB_DEADLINE,
+    DEFAULT_FUSION_MAX_FRAMES,
+    DEFAULT_FUSION_PROMPT,
+    DEFAULT_JOB_DEADLINE,
+    DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_MAX_FRAMES,
+    DEFAULT_MODEL,
+    DEFAULT_PROVIDER_TIMEOUT,
+    DEFAULT_SAMPLING_POLICY,
+    GENERIC_MEDIA_PROMPT,
+    MAX_ATTEMPTS_BOUND,
+    MAX_EXTRACTION_TIMEOUT,
+    MAX_FRAMES_BUDGET,
+    MAX_FUSION_JOB_DEADLINE,
+    MAX_FUSION_MAX_FRAMES,
+    MAX_IMAGE_SOURCE_BYTES,
     MAX_OBJECT_LEN,
     MAX_OBJECTS,
+    MAX_PROVIDER_TIMEOUT,
     MAX_SUMMARY_LEN,
+    MIN_ATTEMPTS,
+    MIN_EXTRACTION_TIMEOUT,
+    MIN_FRAMES,
+    MIN_FUSION_JOB_DEADLINE,
+    MIN_FUSION_MAX_FRAMES,
+    MIN_PROVIDER_TIMEOUT,
+    VALID_SAMPLING_POLICIES,
     VALID_STATUSES,
 )
 
@@ -42,10 +75,372 @@ def format_iso(dt: datetime | None) -> str | None:
     return utc_dt.isoformat()
 
 
-def compute_profile_digest(model: str, instructions: str | None = None) -> str:
-    """Compute deterministic cryptographic digest of model and instructions."""
-    raw = f"{model.strip()}:{(instructions or '').strip()}".encode()
+PROFILE_POLICY_VERSION = 1
+
+
+def build_profile_payload(
+    model: str,
+    instructions: str | None = None,
+    max_frames: int = DEFAULT_MAX_FRAMES,
+    sampling_policy: str = DEFAULT_SAMPLING_POLICY,
+    base_prompt: str = GENERIC_MEDIA_PROMPT,
+    policy_version: int = PROFILE_POLICY_VERSION,
+) -> dict[str, Any]:
+    """Build canonical dictionary of effective semantic configuration."""
+    return {
+        "base_prompt": (base_prompt or GENERIC_MEDIA_PROMPT).strip(),
+        "instructions": (instructions or "").strip(),
+        "max_frames": int(max_frames),
+        "model": model.strip(),
+        "policy_version": int(policy_version),
+        "sampling_policy": (sampling_policy or DEFAULT_SAMPLING_POLICY).strip(),
+    }
+
+
+def canonical_profile_json(payload: dict[str, Any]) -> str:
+    """Serialize profile dictionary to canonical sorted compact JSON."""
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def compute_profile_digest(
+    model: str,
+    instructions: str | None = None,
+    max_frames: int = DEFAULT_MAX_FRAMES,
+    sampling_policy: str = DEFAULT_SAMPLING_POLICY,
+    base_prompt: str = GENERIC_MEDIA_PROMPT,
+    policy_version: int = PROFILE_POLICY_VERSION,
+) -> str:
+    """Compute deterministic cryptographic digest from canonical sorted JSON."""
+    payload = build_profile_payload(
+        model=model,
+        instructions=instructions,
+        max_frames=max_frames,
+        sampling_policy=sampling_policy,
+        base_prompt=base_prompt,
+        policy_version=policy_version,
+    )
+    raw = canonical_profile_json(payload).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def build_job_payload(
+    model: str,
+    instructions: str | None = None,
+    max_frames: int = DEFAULT_MAX_FRAMES,
+    sampling_policy: str = DEFAULT_SAMPLING_POLICY,
+    base_prompt: str = GENERIC_MEDIA_PROMPT,
+    policy_version: int = PROFILE_POLICY_VERSION,
+    job_deadline: float = DEFAULT_JOB_DEADLINE,
+    provider_timeout: float = DEFAULT_PROVIDER_TIMEOUT,
+    extraction_timeout: float = DEFAULT_EXTRACTION_TIMEOUT,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> dict[str, Any]:
+    """Build complete durable job execution snapshot including operational budget."""
+    semantic = build_profile_payload(
+        model=model,
+        instructions=instructions,
+        max_frames=max_frames,
+        sampling_policy=sampling_policy,
+        base_prompt=base_prompt,
+        policy_version=policy_version,
+    )
+    return {
+        **semantic,
+        "budget": {
+            "job_deadline": float(job_deadline),
+            "provider_timeout": float(provider_timeout),
+            "extraction_timeout": float(extraction_timeout),
+            "max_attempts": int(max_attempts),
+        },
+    }
+
+
+def validate_profile_payload(
+    payload_str: str | None,
+    expected_digest: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate durable profile payload and return verified (semantic_profile, budget).
+
+    Raises AnalysisError("INVALID_PROFILE", ...) on corrupt or mismatched snapshots.
+    Never silently falls back to arbitrary current settings on invalid payload.
+    """
+    if not payload_str or not isinstance(payload_str, str):
+        raise AnalysisError("INVALID_PROFILE", "Missing or invalid profile payload string", retryable=False)
+
+    try:
+        data = json.loads(payload_str)
+    except Exception as err:
+        raise AnalysisError("INVALID_PROFILE", f"Corrupt profile payload JSON: {err}", retryable=False) from err
+
+    if not isinstance(data, dict):
+        raise AnalysisError("INVALID_PROFILE", "Profile payload must be a JSON object", retryable=False)
+
+    # 1. Policy version check: must be integer == 1 (non-bool)
+    p_ver = data.get("policy_version")
+    if isinstance(p_ver, bool) or not isinstance(p_ver, int) or p_ver != PROFILE_POLICY_VERSION:
+        raise AnalysisError("INVALID_PROFILE", f"Unsupported policy_version in snapshot: {p_ver}", retryable=False)
+
+    # 2. Semantic fields validation
+    model = data.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise AnalysisError("INVALID_PROFILE", "Invalid or missing model in snapshot", retryable=False)
+    model = model.strip()
+
+    raw_frames = data.get("max_frames")
+    if (
+        isinstance(raw_frames, bool)
+        or not isinstance(raw_frames, (int, float))
+        or not math.isfinite(raw_frames)
+        or (isinstance(raw_frames, float) and not raw_frames.is_integer())
+    ):
+        raise AnalysisError("INVALID_PROFILE", f"Invalid max_frames in snapshot: {raw_frames}", retryable=False)
+    max_frames = int(raw_frames)
+    if not (MIN_FRAMES <= max_frames <= MAX_FRAMES_BUDGET):
+        raise AnalysisError("INVALID_PROFILE", f"max_frames out of bounds [3, 16]: {max_frames}", retryable=False)
+
+    sampling_policy = data.get("sampling_policy")
+    if not isinstance(sampling_policy, str) or sampling_policy not in VALID_SAMPLING_POLICIES:
+        raise AnalysisError(
+            "INVALID_PROFILE", f"Invalid sampling_policy in snapshot: {sampling_policy}", retryable=False
+        )
+
+    base_prompt = data.get("base_prompt")
+    if base_prompt is not None and not isinstance(base_prompt, str):
+        raise AnalysisError("INVALID_PROFILE", "base_prompt must be a string", retryable=False)
+    base_prompt_str = (base_prompt or GENERIC_MEDIA_PROMPT).strip()
+
+    instructions = data.get("instructions")
+    if instructions is not None and not isinstance(instructions, str):
+        raise AnalysisError("INVALID_PROFILE", "instructions must be a string or None", retryable=False)
+    instructions_str = instructions.strip() if instructions else ""
+
+    # Reconstruct canonical semantic dictionary
+    semantic_dict = {
+        "base_prompt": base_prompt_str,
+        "instructions": instructions_str,
+        "max_frames": max_frames,
+        "model": model,
+        "policy_version": p_ver,
+        "sampling_policy": sampling_policy,
+    }
+
+    # 3. Digest verification if requested
+    if expected_digest:
+        raw_canonical = canonical_profile_json(semantic_dict).encode("utf-8")
+        computed_digest = hashlib.sha256(raw_canonical).hexdigest()[:16]
+        if computed_digest != expected_digest:
+            raise AnalysisError(
+                "INVALID_PROFILE",
+                f"Profile payload digest mismatch (expected {expected_digest}, computed {computed_digest})",
+                retryable=False,
+            )
+
+    # 4. Operational budget extraction and validation
+    budget_raw = data.get("budget")
+    if isinstance(budget_raw, dict):
+        b_deadline = budget_raw.get("job_deadline")
+        b_provider = budget_raw.get("provider_timeout")
+        b_extraction = budget_raw.get("extraction_timeout")
+        b_attempts = budget_raw.get("max_attempts", DEFAULT_MAX_ATTEMPTS)
+
+        ok, err = validate_budget_bounds(
+            job_deadline=b_deadline,
+            provider_timeout=b_provider,
+            extraction_timeout=b_extraction,
+            max_frames=max_frames,
+            max_attempts=b_attempts,
+        )
+        if not ok:
+            raise AnalysisError("INVALID_PROFILE", f"Invalid budget bounds in snapshot: {err}", retryable=False)
+
+        budget_dict = {
+            "job_deadline": float(b_deadline),
+            "provider_timeout": float(b_provider),
+            "extraction_timeout": float(b_extraction),
+            "max_attempts": int(b_attempts),
+        }
+    else:
+        # Legacy job without persisted budget snapshot: derive safe coupled bounds for max_frames
+        b_ext = DEFAULT_EXTRACTION_TIMEOUT
+        b_prov = DEFAULT_PROVIDER_TIMEOUT
+        b_cas = CAS_CLEANUP_MARGIN_SECONDS
+        b_dead = max(DEFAULT_JOB_DEADLINE, (max_frames * b_ext) + b_prov + b_cas)
+        budget_dict = {
+            "job_deadline": float(b_dead),
+            "provider_timeout": float(b_prov),
+            "extraction_timeout": float(b_ext),
+            "max_attempts": DEFAULT_MAX_ATTEMPTS,
+        }
+
+    return semantic_dict, budget_dict
+
+
+def derive_reservation_ttl(job_deadline: float, cas_margin: float = CAS_CLEANUP_MARGIN_SECONDS) -> float:
+    """Derive annotation reservation TTL ensuring job execution + CAS margin fits."""
+    return float(job_deadline + cas_margin)
+
+
+def derive_lease_pin_seconds(job_deadline: float, cas_margin: float = CAS_CLEANUP_MARGIN_SECONDS) -> float:
+    """Derive media lease pin duration guaranteeing retention does not delete media during execution."""
+    return max(300.0, float(job_deadline + cas_margin + 60.0))
+
+
+def derive_queue_lease_seconds(
+    job_deadline: float, cas_margin: float = CAS_CLEANUP_MARGIN_SECONDS
+) -> float:
+    """Derive queue lease duration guaranteeing the lease cannot expire while CAS completion is still running."""
+    return float(job_deadline + cas_margin + 30.0)
+
+
+def validate_budget_bounds(
+    job_deadline: Any,
+    provider_timeout: Any,
+    extraction_timeout: Any,
+    max_frames: Any,
+    max_attempts: Any = 3,
+    cas_margin: float = CAS_CLEANUP_MARGIN_SECONDS,
+) -> tuple[bool, str | None]:
+    """Ensure selected budget can fit worst-case sequential extraction + provider timeout + CAS margin."""
+    for val, name in (
+        (job_deadline, "job_deadline"),
+        (provider_timeout, "provider_timeout"),
+        (extraction_timeout, "extraction_timeout"),
+        (max_frames, "max_frames"),
+        (max_attempts, "max_attempts"),
+    ):
+        if isinstance(val, bool):
+            return False, f"{name} must not be a boolean"
+        if not isinstance(val, (int, float)):
+            return False, f"{name} must be a number, got {type(val).__name__}"
+        if not math.isfinite(val):
+            return False, f"{name} must be finite"
+
+    # Integer fields validation: no fractional silent truncation
+    if isinstance(max_frames, float) and not max_frames.is_integer():
+        return False, f"max_frames must be an integer, got {max_frames}"
+    max_frames_int = int(max_frames)
+
+    if isinstance(max_attempts, float) and not max_attempts.is_integer():
+        return False, f"max_attempts must be an integer, got {max_attempts}"
+    max_attempts_int = int(max_attempts)
+
+    deadline_float = float(job_deadline)
+    provider_float = float(provider_timeout)
+    extraction_float = float(extraction_timeout)
+
+    if deadline_float < 60.0 or deadline_float > 600.0:
+        return False, f"job_deadline must be between 60s and 600s, got {deadline_float}s"
+    if provider_float < 10.0 or provider_float > 180.0:
+        return False, f"provider_timeout must be between 10s and 180s, got {provider_float}s"
+    if extraction_float < 2.0 or extraction_float > 30.0:
+        return False, f"extraction_timeout must be between 2s and 30s, got {extraction_float}s"
+    if max_frames_int < 3 or max_frames_int > 16:
+        return False, f"max_frames must be between 3 and 16, got {max_frames_int}"
+    if max_attempts_int < 1 or max_attempts_int > 5:
+        return False, f"max_attempts must be between 1 and 5, got {max_attempts_int}"
+
+    # Sequential worst-case bound: max_frames * extraction_timeout + provider_timeout + cas_margin
+    min_required = (max_frames_int * extraction_float) + provider_float + cas_margin
+    if deadline_float < min_required:
+        return False, (
+            f"Job deadline ({deadline_float:.1f}s) is insufficient for selected budget "
+            f"(sequential extraction for {max_frames_int} frames at {extraction_float:.1f}s each = "
+            f"{max_frames_int * extraction_float:.1f}s + provider {provider_float:.1f}s + "
+            f"CAS margin {cas_margin:.1f}s requires at least {min_required:.1f}s)"
+        )
+    return True, None
+
+
+def validate_fusion_budget_bounds(
+    fusion_job_deadline: Any,
+    fusion_max_frames: Any,
+    provider_timeout: Any = DEFAULT_PROVIDER_TIMEOUT,
+    extraction_timeout: Any = DEFAULT_EXTRACTION_TIMEOUT,
+    max_attempts: Any = DEFAULT_MAX_ATTEMPTS,
+    cas_margin: float = CAS_CLEANUP_MARGIN_SECONDS,
+) -> tuple[bool, str | None]:
+    """Ensure selected fusion budget can fit multi-camera extraction + provider timeout + CAS margin."""
+    for val, name in (
+        (fusion_job_deadline, "fusion_job_deadline"),
+        (fusion_max_frames, "fusion_max_frames"),
+        (provider_timeout, "provider_timeout"),
+        (extraction_timeout, "extraction_timeout"),
+        (max_attempts, "max_attempts"),
+    ):
+        if isinstance(val, bool):
+            return False, f"{name} must not be a boolean"
+        if not isinstance(val, (int, float)):
+            return False, f"{name} must be a number, got {type(val).__name__}"
+        if not math.isfinite(val):
+            return False, f"{name} must be finite"
+
+    # Integer fields validation: no fractional silent truncation
+    if isinstance(fusion_max_frames, float) and not fusion_max_frames.is_integer():
+        return False, f"fusion_max_frames must be an integer, got {fusion_max_frames}"
+    if isinstance(max_attempts, float) and not max_attempts.is_integer():
+        return False, f"max_attempts must be an integer, got {max_attempts}"
+    fusion_frames_int = int(fusion_max_frames)
+    max_attempts_int = int(max_attempts)
+
+    deadline_float = float(fusion_job_deadline)
+    provider_float = float(provider_timeout)
+    extraction_float = float(extraction_timeout)
+
+    if not (MIN_PROVIDER_TIMEOUT <= provider_float <= MAX_PROVIDER_TIMEOUT):
+        return False, f"provider_timeout must be between {MIN_PROVIDER_TIMEOUT}s and {MAX_PROVIDER_TIMEOUT}s"
+    if not (MIN_EXTRACTION_TIMEOUT <= extraction_float <= MAX_EXTRACTION_TIMEOUT):
+        return False, f"extraction_timeout must be between {MIN_EXTRACTION_TIMEOUT}s and {MAX_EXTRACTION_TIMEOUT}s"
+    if not (MIN_ATTEMPTS <= max_attempts_int <= MAX_ATTEMPTS_BOUND):
+        return False, f"max_attempts must be between {MIN_ATTEMPTS} and {MAX_ATTEMPTS_BOUND}"
+
+    if deadline_float < MIN_FUSION_JOB_DEADLINE or deadline_float > MAX_FUSION_JOB_DEADLINE:
+        return False, f"fusion_job_deadline must be between {MIN_FUSION_JOB_DEADLINE}s and {MAX_FUSION_JOB_DEADLINE}s, got {deadline_float}s"
+    if fusion_frames_int < MIN_FUSION_MAX_FRAMES or fusion_frames_int > MAX_FUSION_MAX_FRAMES:
+        return False, f"fusion_max_frames must be between {MIN_FUSION_MAX_FRAMES} and {MAX_FUSION_MAX_FRAMES}, got {fusion_frames_int}"
+
+    # Worst-case: extracting up to fusion_frames_int frames across views + provider call + CAS margin
+    min_required = (fusion_frames_int * extraction_float) + provider_float + cas_margin
+    if deadline_float < min_required:
+        return False, (
+            f"Fusion job deadline ({deadline_float:.1f}s) is insufficient for selected budget "
+            f"(sequential extraction for {fusion_frames_int} frames at {extraction_float:.1f}s each = "
+            f"{fusion_frames_int * extraction_float:.1f}s + provider {provider_float:.1f}s + "
+            f"CAS margin {cas_margin:.1f}s requires at least {min_required:.1f}s)"
+        )
+    return True, None
+
+
+def validate_input_bytes(size_bytes: Any) -> tuple[bool, str | None]:
+    """Validate that input media bytes are within static bounds (10MB)."""
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, (int, float)):
+        return False, "Input bytes must be a numeric integer"
+    if not math.isfinite(size_bytes):
+        return False, "Input bytes must be finite"
+    size_int = int(size_bytes)
+    if size_int < 0:
+        return False, f"Input bytes cannot be negative: {size_int}"
+    if size_int > MAX_IMAGE_SOURCE_BYTES:
+        return False, (
+            f"Input size ({size_int} bytes) exceeds maximum allowable limit of "
+            f"{MAX_IMAGE_SOURCE_BYTES} bytes ({MAX_IMAGE_SOURCE_BYTES // (1024 * 1024)} MB)"
+        )
+    return True, None
+
+
+def is_rolling_model_alias(model: str) -> bool:
+    """Return True if model name appears to be a rolling alias (e.g. contains '-latest')."""
+    m = model.lower().strip()
+    return "-latest" in m or m.endswith("-preview") or m == "gemini-pro"
+
+
+def model_alias_info(model: str) -> str:
+    """Return factual classification of model alias vs fixed checkpoint."""
+    m = model.lower().strip()
+    if is_rolling_model_alias(m):
+        return "Rolling model alias (resolves dynamically to latest provider checkpoint)"
+    if re.search(r"-\d{3,4}$", m) or re.search(r"-\d{8}$", m) or re.search(r"-v\d+", m):
+        return "Fixed model version checkpoint"
+    return "Custom or unverified model identifier (versioning policy unknown)"
 
 
 def sanitize_error_code(err: Any) -> str:
@@ -140,6 +535,7 @@ class AnalysisResult:
     summary: str
     activity: bool
     objects: list[str] = field(default_factory=list)
+    model_version: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.summary, str):
@@ -164,7 +560,9 @@ class AnalysisAnnotation:
       "media_revision": int,
       "generation": int,
       "model"?: str,
-      "updated_at"?: str (ISO-8601)
+      "model_version"?: str,
+      "updated_at"?: str (ISO-8601),
+      "frames"?: list[dict[str, Any]]
     }
     """
 
@@ -176,7 +574,9 @@ class AnalysisAnnotation:
     objects: list[str] | None = None
     error_code: str | None = None
     model: str | None = None
+    model_version: str | None = None
     updated_at: str | None = None
+    frames: list[dict[str, Any]] | None = None
 
     def __post_init__(self) -> None:
         if self.status not in VALID_STATUSES:
@@ -203,8 +603,12 @@ class AnalysisAnnotation:
             payload["error_code"] = sanitize_error_code(self.error_code)
         if self.model is not None:
             payload["model"] = self.model
+        if self.model_version is not None:
+            payload["model_version"] = self.model_version
         if self.updated_at is not None:
             payload["updated_at"] = self.updated_at
+        if self.frames is not None:
+            payload["frames"] = self.frames
         return payload
 
     @classmethod
@@ -219,7 +623,9 @@ class AnalysisAnnotation:
             objects=data.get("objects"),
             error_code=data.get("error_code"),
             model=data.get("model"),
+            model_version=data.get("model_version"),
             updated_at=data.get("updated_at"),
+            frames=data.get("frames"),
         )
 
 
@@ -242,11 +648,367 @@ class AnalysisJob:
     is_manual: bool = False
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
+    profile_payload: str | None = None
 
 
 @dataclass(frozen=True)
 class ExtractedFrame:
-    """An extracted image frame ready for provider transport."""
+    """An extracted image frame ready for provider transport and provenance tracking."""
 
     data: bytes
     mime_type: str = "image/jpeg"
+    media_id: str | None = None
+    offset_seconds: float = 0.0
+    timestamp_quality: str = "unknown"  # "exact" | "estimated" | "relative_fallback" | "unknown"
+    offset_quality: str = "exact"  # "exact" | "estimated" | "relative_fallback" | "unknown"
+
+
+@dataclass(frozen=True)
+class Incident:
+    """Core neutral frozen incident model matching the cross-component contract."""
+
+    incident_id: str
+    anchor_at: datetime
+    membership_revision: int
+    span_start: datetime | None = None
+    span_end: datetime | None = None
+    annotations: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class IncidentInputs:
+    """Immutable snapshot of incident context and member recorded events."""
+
+    incident: Incident
+    events: tuple[Any, ...]  # tuple of RecordedEvent
+    input_token: str
+
+
+@dataclass(frozen=True)
+class FusionJob:
+    """Durable fusion job tracking record keyed by (incident_id, input_token, profile_digest)."""
+
+    id: int | None
+    incident_id: str
+    input_token: str
+    profile_digest: str
+    generation: int = 1
+    annotation_generation: int | None = None
+    status: str = "pending"
+    attempts: int = 0
+    leased_by: str | None = None
+    leased_until: datetime | None = None
+    next_attempt_at: datetime | None = None
+    last_error: str | None = None
+    is_manual: bool = False
+    created_at: datetime = field(default_factory=utc_now)
+    updated_at: datetime = field(default_factory=utc_now)
+    profile_payload: str | None = None
+
+
+@dataclass(frozen=True)
+class FusionViewFrame:
+    """Frame extracted from a member camera view for multi-camera visual fusion."""
+
+    frame_ref: str  # e.g., "view1_frame0"
+    data: bytes
+    mime_type: str = "image/jpeg"
+    timestamp_ms: int = 0
+    time_quality: str = "relative"  # "known_utc" | "relative" | "unknown"
+    offset_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class FusionViewInput:
+    """Anonymized member view with frames and sanitized per-view observations."""
+
+    view_index: int  # 1-based index (1, 2, ...)
+    view_label: str  # e.g., "View 1", "View 2"
+    time_quality: str  # "known_utc" | "relative" | "unknown"
+    observations: str | None = None  # Generic summary from per-camera analysis
+    frames: list[FusionViewFrame] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PossibleCrossViewMatch:
+    """Cross-view correspondence hypothesis with explicit uncertainty and evidence refs."""
+
+    description: str
+    evidence_refs: list[str]
+    uncertainty: str = "medium"  # "low" | "medium" | "high"
+    same_subject_confidence: str = "uncertain"  # "unlikely" | "possible" | "uncertain"
+
+
+@dataclass(frozen=True)
+class FusionResult:
+    """Validated result of visual multi-camera fusion analysis."""
+
+    narrative: str
+    activity: bool
+    possible_cross_view_matches: list[dict[str, Any]]
+    model_version: str
+
+
+@dataclass(frozen=True)
+class FusionAnnotation:
+    """Wire representation stored in event_recording incident annotations."""
+
+    status: str
+    input_token: str
+    generation: int
+    profile_digest: str
+    narrative: str | None = None
+    activity: bool | None = None
+    possible_cross_view_matches: list[dict[str, Any]] | None = None
+    error_code: str | None = None
+    skipped_reason: str | None = None
+    model: str | None = None
+    model_version: str | None = None
+    updated_at: str | None = None
+    member_events: list[str] | None = None
+    view_frames: list[dict[str, Any]] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to strict wire dictionary with non-None optional fields."""
+        d: dict[str, Any] = {
+            "status": self.status,
+            "input_token": self.input_token,
+            "generation": self.generation,
+            "profile_digest": self.profile_digest,
+        }
+        if self.narrative is not None:
+            d["narrative"] = self.narrative[:MAX_SUMMARY_LEN * 2]
+        if self.activity is not None:
+            d["activity"] = self.activity
+        if self.possible_cross_view_matches is not None:
+            d["possible_cross_view_matches"] = self.possible_cross_view_matches[:20]
+        if self.error_code is not None:
+            d["error_code"] = sanitize_error_code(self.error_code)
+        if self.skipped_reason is not None:
+            d["skipped_reason"] = sanitize_error_code(self.skipped_reason)
+        if self.model is not None:
+            d["model"] = self.model
+        if self.model_version is not None:
+            d["model_version"] = self.model_version
+        if self.updated_at is not None:
+            d["updated_at"] = self.updated_at
+        if self.member_events is not None:
+            d["member_events"] = self.member_events
+        if self.view_frames is not None:
+            d["view_frames"] = self.view_frames
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> FusionAnnotation:
+        """Construct from raw dictionary."""
+        return cls(
+            status=data["status"],
+            input_token=data["input_token"],
+            generation=data["generation"],
+            profile_digest=data["profile_digest"],
+            narrative=data.get("narrative"),
+            activity=data.get("activity"),
+            possible_cross_view_matches=data.get("possible_cross_view_matches"),
+            error_code=data.get("error_code"),
+            skipped_reason=data.get("skipped_reason"),
+            model=data.get("model"),
+            model_version=data.get("model_version"),
+            updated_at=data.get("updated_at"),
+            member_events=data.get("member_events"),
+            view_frames=data.get("view_frames"),
+        )
+
+
+
+
+
+def compute_fusion_profile_digest(
+    model: str = DEFAULT_MODEL,
+    fusion_prompt: str = DEFAULT_FUSION_PROMPT,
+    instructions: str | None = None,
+    max_frames: int = DEFAULT_FUSION_MAX_FRAMES,
+    sampling_policy: str = DEFAULT_SAMPLING_POLICY,
+    version: int = PROFILE_POLICY_VERSION,
+) -> str:
+    """Compute deterministic cryptographic digest from canonical sorted JSON for fusion."""
+    payload = {
+        "fusion_prompt": (fusion_prompt or DEFAULT_FUSION_PROMPT).strip(),
+        "instructions": (instructions or "").strip(),
+        "max_frames": int(max_frames),
+        "model": model.strip(),
+        "policy_version": int(version),
+        "sampling_policy": (sampling_policy or DEFAULT_SAMPLING_POLICY).strip(),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def build_fusion_job_payload(
+    model: str = DEFAULT_MODEL,
+    fusion_prompt: str = DEFAULT_FUSION_PROMPT,
+    instructions: str | None = None,
+    max_frames: int = DEFAULT_FUSION_MAX_FRAMES,
+    sampling_policy: str = DEFAULT_SAMPLING_POLICY,
+    job_deadline: float = DEFAULT_FUSION_JOB_DEADLINE,
+    provider_timeout: float = DEFAULT_PROVIDER_TIMEOUT,
+    extraction_timeout: float = DEFAULT_EXTRACTION_TIMEOUT,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    version: int = PROFILE_POLICY_VERSION,
+) -> dict[str, Any]:
+    """Build complete durable fusion job execution snapshot including operational budget."""
+    return {
+        "fusion_prompt": (fusion_prompt or DEFAULT_FUSION_PROMPT).strip(),
+        "instructions": (instructions or "").strip(),
+        "max_frames": int(max_frames),
+        "model": model.strip(),
+        "policy_version": int(version),
+        "sampling_policy": (sampling_policy or DEFAULT_SAMPLING_POLICY).strip(),
+        "budget": {
+            "job_deadline": float(job_deadline),
+            "provider_timeout": float(provider_timeout),
+            "extraction_timeout": float(extraction_timeout),
+            "max_attempts": int(max_attempts),
+        },
+    }
+
+
+def validate_fusion_profile_payload(
+    payload_str: str,
+    expected_digest: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate snapshot against strict bounds and verify profile digest consistency."""
+    if not payload_str or not isinstance(payload_str, str):
+        raise AnalysisError("INVALID_PROFILE", "Missing or non-string fusion payload", retryable=False)
+
+    try:
+        data = json.loads(payload_str)
+    except Exception as err:
+        raise AnalysisError("INVALID_PROFILE", f"Malformed fusion profile JSON: {err}", retryable=False) from err
+
+    if not isinstance(data, dict):
+        raise AnalysisError("INVALID_PROFILE", "Fusion profile payload must be a JSON object", retryable=False)
+
+    model_raw = data.get("model", "")
+    if not isinstance(model_raw, str):
+        raise AnalysisError("INVALID_PROFILE", "Invalid model name", retryable=False)
+    model = model_raw.strip()
+    if not model or len(model) > 100:
+        raise AnalysisError("INVALID_PROFILE", f"Invalid model name: '{model}'", retryable=False)
+
+    raw_frames = data.get("max_frames", DEFAULT_FUSION_MAX_FRAMES)
+    if (
+        isinstance(raw_frames, bool)
+        or not isinstance(raw_frames, (int, float))
+        or not math.isfinite(raw_frames)
+        or (isinstance(raw_frames, float) and not raw_frames.is_integer())
+    ):
+        raise AnalysisError("INVALID_PROFILE", f"Invalid max_frames: {raw_frames}", retryable=False)
+    max_frames = int(raw_frames)
+    if not (MIN_FUSION_MAX_FRAMES <= max_frames <= MAX_FUSION_MAX_FRAMES):
+        raise AnalysisError("INVALID_PROFILE", f"max_frames out of bounds: {max_frames}", retryable=False)
+
+    sampling_policy_raw = data.get("sampling_policy", DEFAULT_SAMPLING_POLICY)
+    if not isinstance(sampling_policy_raw, str):
+        raise AnalysisError("INVALID_PROFILE", f"Invalid sampling_policy: {sampling_policy_raw}", retryable=False)
+    sampling_policy = sampling_policy_raw.strip()
+    if sampling_policy not in VALID_SAMPLING_POLICIES:
+        raise AnalysisError("INVALID_PROFILE", f"Invalid sampling_policy: {sampling_policy}", retryable=False)
+
+    policy_version = data.get("policy_version", PROFILE_POLICY_VERSION)
+    if (
+        isinstance(policy_version, bool)
+        or not isinstance(policy_version, int)
+        or policy_version != PROFILE_POLICY_VERSION
+    ):
+        raise AnalysisError("INVALID_PROFILE", f"Unsupported policy_version: {policy_version}", retryable=False)
+    fusion_prompt_raw = data.get("fusion_prompt", DEFAULT_FUSION_PROMPT)
+    instructions_raw = data.get("instructions", "")
+    if not isinstance(fusion_prompt_raw, str) or not isinstance(instructions_raw, str):
+        raise AnalysisError("INVALID_PROFILE", "Fusion prompt and instructions must be strings", retryable=False)
+    fusion_prompt = fusion_prompt_raw.strip()
+    instructions = instructions_raw.strip()
+
+    semantic_dict = {
+        "fusion_prompt": fusion_prompt,
+        "instructions": instructions,
+        "max_frames": max_frames,
+        "model": model,
+        "policy_version": policy_version,
+        "sampling_policy": sampling_policy,
+    }
+
+    if expected_digest:
+        raw_canonical = json.dumps(semantic_dict, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        computed_digest = hashlib.sha256(raw_canonical).hexdigest()[:16]
+        if computed_digest != expected_digest:
+            raise AnalysisError(
+                "INVALID_PROFILE",
+                f"Fusion digest mismatch (expected {expected_digest}, computed {computed_digest})",
+                retryable=False,
+            )
+
+    budget_raw = data.get("budget", {})
+    if not isinstance(budget_raw, dict):
+        raise AnalysisError("INVALID_PROFILE", "budget field must be a JSON object", retryable=False)
+
+    job_deadline_raw = budget_raw.get("job_deadline", DEFAULT_FUSION_JOB_DEADLINE)
+    provider_timeout_raw = budget_raw.get("provider_timeout", DEFAULT_PROVIDER_TIMEOUT)
+    extraction_timeout_raw = budget_raw.get("extraction_timeout", DEFAULT_EXTRACTION_TIMEOUT)
+    max_attempts_raw = budget_raw.get("max_attempts", DEFAULT_MAX_ATTEMPTS)
+    valid_budget, budget_error = validate_fusion_budget_bounds(
+        fusion_job_deadline=job_deadline_raw,
+        fusion_max_frames=max_frames,
+        provider_timeout=provider_timeout_raw,
+        extraction_timeout=extraction_timeout_raw,
+        max_attempts=max_attempts_raw,
+    )
+    if not valid_budget:
+        raise AnalysisError("INVALID_PROFILE", f"Invalid fusion budget in snapshot: {budget_error}", retryable=False)
+    job_deadline = float(job_deadline_raw)
+    provider_timeout = float(provider_timeout_raw)
+    extraction_timeout = float(extraction_timeout_raw)
+    max_attempts = int(max_attempts_raw)
+
+    budget_dict = {
+        "job_deadline": job_deadline,
+        "provider_timeout": provider_timeout,
+        "extraction_timeout": extraction_timeout,
+        "max_attempts": max_attempts,
+    }
+
+    return semantic_dict, budget_dict
+
+
+def is_user_authorized_for_event(user: Any, event: Any) -> bool:
+    """Check whether a user has read access to an event based on ACLs, access entities, and owner.
+
+    Stand-alone implementation with zero mandatory runtime import of event_recording or Home Assistant.
+    """
+    if not user or not getattr(user, "is_active", True):
+        return False
+    if getattr(user, "is_admin", False):
+        return True
+
+    # 1. Access entities: user must have 'read' permissions for all declared access entities
+    access_ents = getattr(event, "access_entities", None)
+    if access_ents:
+        permissions = getattr(user, "permissions", None)
+        if not permissions:
+            return False
+        return all(permissions.check_entity(ent, "read") for ent in access_ents)
+
+    # 2. Entity resource_key: if resource_key is an entity ID, check read permission
+    res_key = getattr(event, "resource_key", None)
+    if res_key and isinstance(res_key, str) and "." in res_key:
+        permissions = getattr(user, "permissions", None)
+        if not permissions:
+            return False
+        if permissions.check_entity(res_key, "read"):
+            return True
+
+    # 3. Owner journal fallback: if user is the owner, allowed
+    owner_id = getattr(event, "owner_user_id", None)
+    if owner_id and owner_id == getattr(user, "id", None):
+        return True
+
+    return False
