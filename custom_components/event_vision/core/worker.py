@@ -25,12 +25,9 @@ from typing import Any
 from ..const import (
     ANNOTATION_NAMESPACE,
     BASE_BACKOFF_SECONDS,
-    CONSUMER_ID,
-    DEFAULT_ENABLE_FUSION,
     DEFAULT_EXTRACTION_TIMEOUT,
     DEFAULT_FUSION_JOB_DEADLINE,
     DEFAULT_FUSION_MAX_FRAMES,
-    DEFAULT_FUSION_PROMPT,
     DEFAULT_JOB_DEADLINE,
     DEFAULT_MAX_ATTEMPTS,
     DEFAULT_MAX_FRAMES,
@@ -48,6 +45,7 @@ from ..const import (
     STATUS_SKIPPED,
     VALID_SAMPLING_POLICIES,
 )
+from .cache import FrameCache, compute_source_fingerprint
 from .extractor import FrameExtractor
 from .fusion_store import FusionJobStore
 from .gemini import GeminiClient
@@ -61,10 +59,8 @@ from .models import (
     FusionViewFrame,
     FusionViewInput,
     IncidentInputs,
-    build_fusion_job_payload,
     build_job_payload,
     canonical_profile_json,
-    compute_fusion_profile_digest,
     compute_profile_digest,
     derive_lease_pin_seconds,
     derive_queue_lease_seconds,
@@ -106,9 +102,11 @@ class AnalysisWorker:
         fusion_max_frames: int = DEFAULT_FUSION_MAX_FRAMES,
         fusion_prompt_instructions: str | None = None,
         fusion_job_deadline: float = DEFAULT_FUSION_JOB_DEADLINE,
+        cache: FrameCache | None = None,
     ) -> None:
         self._job_store = job_store
         self._fusion_job_store = fusion_job_store
+        self._cache = cache or getattr(frame_extractor, "cache", None)
         self._enable_fusion = bool(enable_fusion)
         self._fusion_max_frames = max(
             MIN_FUSION_MAX_FRAMES, min(int(fusion_max_frames), MAX_FUSION_MAX_FRAMES)
@@ -152,6 +150,11 @@ class AnalysisWorker:
     def incident_lock(self, incident_id: str) -> asyncio.Lock:
         """Serialize short queue/reservation transitions for an incident."""
         return self.incident_locks.setdefault(incident_id, asyncio.Lock())
+
+    @property
+    def cache(self) -> FrameCache | None:
+        """Return attached FrameCache instance if configured."""
+        return self._cache
 
     @property
     def enable_fusion(self) -> bool:
@@ -336,7 +339,7 @@ class AnalysisWorker:
 
     async def _execute_job(self, job: AnalysisJob) -> None:
         """Execute single analysis job with derived media lease pin and CAS protection."""
-        if not await self._job_store.is_job_current(job.id, job.generation):
+        if not await self._job_store.is_job_current(job.id, job.generation, claim_token=job.claim_token):
             _LOGGER.info(
                 "Job %s (gen %s) is no longer current; aborting execution",
                 job.event_id,
@@ -346,11 +349,11 @@ class AnalysisWorker:
 
         # 1. Ensure annotation reservation exists under per-event lock BEFORE payload validation
         async with self.event_lock(job.event_id):
-            if not await self._job_store.is_job_current(job.id, job.generation):
+            if not await self._job_store.is_job_current(job.id, job.generation, claim_token=job.claim_token):
                 return
             event = await self._rec_api.get_event(job.event_id)
             if not event or event.media_revision != job.media_revision:
-                await self._job_store.supersede_job(job.id, job.generation)
+                await self._job_store.supersede_job(job.id, job.generation, claim_token=job.claim_token)
                 return
             existing_ann = event.annotations.get(ANNOTATION_NAMESPACE, {})
             existing_gen = existing_ann.get("generation", 0)
@@ -366,10 +369,10 @@ class AnalysisWorker:
                     ttl_seconds=res_ttl,
                 )
                 if annotation_gen is None:
-                    await self._job_store.supersede_job(job.id, job.generation)
+                    await self._job_store.supersede_job(job.id, job.generation, claim_token=job.claim_token)
                     return
                 await self._job_store.update_job_annotation_generation(
-                    job.id, job.generation, annotation_gen
+                    job.id, job.generation, annotation_gen, claim_token=job.claim_token
                 )
                 job = replace(job, annotation_generation=annotation_gen)
             else:
@@ -435,7 +438,7 @@ class AnalysisWorker:
 
             # 4. Set processing status via CAS using claimed generation
             async with self.event_lock(job.event_id):
-                if not await self._job_store.is_job_current(job.id, job.generation):
+                if not await self._job_store.is_job_current(job.id, job.generation, claim_token=job.claim_token):
                     return
 
                 proc_annotation = AnalysisAnnotation(
@@ -463,12 +466,12 @@ class AnalysisWorker:
             event = await self._rec_api.get_event(job.event_id)
             if not event or event.media_revision != job.media_revision:
                 _LOGGER.warning("Event %s changed media revision mid-run", job.event_id)
-                await self._job_store.supersede_job(job.id, job.generation)
+                await self._job_store.supersede_job(job.id, job.generation, claim_token=job.claim_token)
                 return
 
             available_media = [m for m in event.media if getattr(m, "available", True)]
             if not available_media:
-                if not await self._job_store.is_job_current(job.id, job.generation):
+                if not await self._job_store.is_job_current(job.id, job.generation, claim_token=job.claim_token):
                     return
                 skip_annotation = AnalysisAnnotation(
                     status=STATUS_SKIPPED,
@@ -485,7 +488,9 @@ class AnalysisWorker:
                     payload=skip_annotation.to_dict(),
                     expected_generation=annotation_gen,
                 )
-                await self._job_store.skip_job(job.id, job.generation, "MEDIA_UNAVAILABLE")
+                await self._job_store.skip_job(
+                    job.id, job.generation, "MEDIA_UNAVAILABLE", claim_token=job.claim_token
+                )
                 return
 
             # 5. Plan frame sampling across media items
@@ -539,6 +544,7 @@ class AnalysisWorker:
                         media_id=m_id,
                         timestamp_quality=quality,
                         offset_quality=offset_q,
+                        media_revision=job.media_revision,
                     )
                     accumulated_frames.extend(frames)
                 except Exception as err:
@@ -564,7 +570,7 @@ class AnalysisWorker:
             )
 
             # 7. Post CAS complete state with frame provenance and returned modelVersion
-            if not await self._job_store.is_job_current(job.id, job.generation):
+            if not await self._job_store.is_job_current(job.id, job.generation, claim_token=job.claim_token):
                 _LOGGER.warning(
                     "Job %s superseded before complete commit; skipping CAS", job.event_id
                 )
@@ -601,7 +607,7 @@ class AnalysisWorker:
             )
 
             if committed:
-                await self._job_store.complete_job(job.id, job.generation)
+                await self._job_store.complete_job(job.id, job.generation, claim_token=job.claim_token)
                 _LOGGER.info(
                     "Successfully analyzed and committed event %s (media_rev=%s, gen=%s)",
                     job.event_id,
@@ -613,11 +619,11 @@ class AnalysisWorker:
                     "CAS commit rejected on completion for %s; stale generation or media revision",
                     job.event_id,
                 )
-                await self._job_store.supersede_job(job.id, job.generation)
+                await self._job_store.supersede_job(job.id, job.generation, claim_token=job.claim_token)
 
         except Exception as err:
             if not self._rec_api.store.is_open:
-                await self._job_store.defer_job(job.id, job.generation)
+                await self._job_store.defer_job(job.id, job.generation, claim_token=job.claim_token)
             else:
                 await self._handle_job_failure(job, err)
         finally:
@@ -667,7 +673,7 @@ class AnalysisWorker:
         backoff = BASE_BACKOFF_SECONDS * (2**job.attempts)
 
         # Check if job is still current in our store
-        if not await self._job_store.is_job_current(job.id, job.generation):
+        if not await self._job_store.is_job_current(job.id, job.generation, claim_token=job.claim_token):
             _LOGGER.info("Job %s was superseded; ignoring failure handler", job.event_id)
             return
 
@@ -676,15 +682,19 @@ class AnalysisWorker:
         )
         if current is None or current.generation != job.generation:
             return
+        token = job.claim_token
         job = current
-        # Update local job store
-        await self._job_store.fail_job(
+        # Update local job store with per-claim fence check
+        failed_ok = await self._job_store.fail_job(
             job.id,
             job.generation,
             error_code=clean_code,
             retryable=retryable,
             backoff_seconds=backoff,
+            claim_token=token,
         )
+        if not failed_ok:
+            return
 
         job_max_attempts = self._max_attempts
         job_model = (
@@ -793,6 +803,9 @@ class AnalysisWorker:
         if not available_media:
             return []
 
+        event_rev = getattr(event, "media_revision", 1)
+
+        # Plan event sampling across ALL available media items upfront (never chunk 1 alone consuming entire budget)
         planned_anchors = plan_event_sampling(
             media_items=available_media,
             policy=policy,
@@ -800,6 +813,8 @@ class AnalysisWorker:
             event_start_at=getattr(event, "start_at", None),
             source_events=getattr(event, "source_events", ()),
         )
+        if not planned_anchors:
+            return []
 
         anchors_by_media: dict[str, list[Any]] = {}
         for a in planned_anchors:
@@ -809,6 +824,9 @@ class AnalysisWorker:
         accumulated_frames: list[ExtractedFrame] = []
 
         for m_id, item_anchors in anchors_by_media.items():
+            if len(accumulated_frames) >= max_frames:
+                break
+
             media_item = media_by_id.get(m_id)
             if not media_item:
                 continue
@@ -824,13 +842,49 @@ class AnalysisWorker:
                 )
                 continue
 
+            stat_res = await asyncio.to_thread(resolved_path.stat)
+            source_fp = compute_source_fingerprint(resolved_path, stat_res)
+
             ts_list = [a.offset_seconds for a in item_anchors]
-            quality = item_anchors[0].timestamp_quality if item_anchors else "unknown"
+            quality = getattr(item_anchors[0], "timestamp_quality", "unknown") if item_anchors else "unknown"
             offset_q = (
-                getattr(item_anchors[0], "offset_quality", "exact")
-                if item_anchors
-                else "exact"
+                getattr(item_anchors[0], "offset_quality", "unknown") if item_anchors else "unknown"
             )
+
+            # Warm path: Check if FrameCache contains warm extracted frames matching planned anchors
+            if self._cache and self._cache.enabled:
+                cached_anchors = await self._cache.get_cached_anchors(source_fp, event_rev)
+                if cached_anchors:
+                    cached_seeks = {round(c[0], 2): c for c in cached_anchors}
+                    all_cached = [cached_seeks.get(round(ts, 2)) for ts in ts_list]
+                    if all(c is not None for c in all_cached):
+                        for anchor_obj, c in zip(item_anchors, all_cached):
+                            assert c is not None
+                            accumulated_frames.append(
+                                ExtractedFrame(
+                                    data=c[1],
+                                    mime_type=c[2],
+                                    media_id=m_id,
+                                    offset_seconds=c[0],
+                                    timestamp_quality=getattr(anchor_obj, "timestamp_quality", "unknown"),
+                                    offset_quality=getattr(anchor_obj, "offset_quality", "unknown"),
+                                )
+                            )
+                        continue
+                    elif len(cached_anchors) >= len(item_anchors):
+                        subset = FrameCache.select_compatible_subset(cached_anchors, len(item_anchors))
+                        for anchor_obj, c in zip(item_anchors, subset):
+                            accumulated_frames.append(
+                                ExtractedFrame(
+                                    data=c[1],
+                                    mime_type=c[2],
+                                    media_id=m_id,
+                                    offset_seconds=c[0],
+                                    timestamp_quality=getattr(anchor_obj, "timestamp_quality", "unknown"),
+                                    offset_quality=getattr(anchor_obj, "offset_quality", "unknown"),
+                                )
+                            )
+                        continue
 
             try:
                 frames = await self._extractor.extract_from_path(
@@ -844,6 +898,8 @@ class AnalysisWorker:
                     media_id=m_id,
                     timestamp_quality=quality,
                     offset_quality=offset_q,
+                    media_revision=event_rev,
+                    source_fingerprint=source_fp,
                 )
                 accumulated_frames.extend(frames)
             except Exception as err:
@@ -890,7 +946,7 @@ class AnalysisWorker:
     async def _execute_fusion_job(self, job: FusionJob) -> None:
         """Execute single multi-camera incident visual fusion job with CAS protection."""
         if not self._fusion_job_store or not await self._fusion_job_store.is_fusion_job_current(
-            job.id, job.generation
+            job.id, job.generation, claim_token=job.claim_token
         ):
             _LOGGER.info(
                 "Fusion job %s (gen %s) is no longer current; aborting execution",
@@ -900,23 +956,27 @@ class AnalysisWorker:
             return
 
         if not self._enable_fusion:
-            await self._fusion_job_store.skip_fusion_job(job.id, job.generation, "FUSION_DISABLED")
+            await self._fusion_job_store.skip_fusion_job(
+                job.id, job.generation, "FUSION_DISABLED", claim_token=job.claim_token
+            )
             return
 
         if self._gemini is None:
             await self._fusion_job_store.fail_fusion_job(
-                job.id, job.generation, "MISSING_API_KEY", retryable=False
+                job.id, job.generation, "MISSING_API_KEY", retryable=False, claim_token=job.claim_token
             )
             return
 
         if not hasattr(self._rec_api, "get_incident_inputs"):
             await self._fusion_job_store.fail_fusion_job(
-                job.id, job.generation, "INCIDENT_API_UNAVAILABLE", retryable=False
+                job.id, job.generation, "INCIDENT_API_UNAVAILABLE", retryable=False, claim_token=job.claim_token
             )
             return
 
         async with self.incident_lock(job.incident_id):
-            if not await self._fusion_job_store.is_fusion_job_current(job.id, job.generation):
+            if not await self._fusion_job_store.is_fusion_job_current(
+                job.id, job.generation, claim_token=job.claim_token
+            ):
                 return
 
             semantic, budget = validate_fusion_profile_payload(
@@ -935,7 +995,9 @@ class AnalysisWorker:
                 job.incident_id, ANNOTATION_NAMESPACE
             )
             if inputs is None:
-                await self._fusion_job_store.supersede_fusion_job(job.id, job.generation)
+                await self._fusion_job_store.supersede_fusion_job(
+                    job.id, job.generation, claim_token=job.claim_token
+                )
                 return
 
             if inputs.input_token != job.input_token:
@@ -945,7 +1007,9 @@ class AnalysisWorker:
                     job.input_token,
                     inputs.input_token,
                 )
-                await self._fusion_job_store.supersede_fusion_job(job.id, job.generation)
+                await self._fusion_job_store.supersede_fusion_job(
+                    job.id, job.generation, claim_token=job.claim_token
+                )
                 return
 
             events = inputs.events
@@ -957,7 +1021,9 @@ class AnalysisWorker:
                     in_flight = True
                     break
             if in_flight:
-                await self._fusion_job_store.defer_fusion_job(job.id, job.generation)
+                await self._fusion_job_store.defer_fusion_job(
+                    job.id, job.generation, claim_token=job.claim_token
+                )
                 return
 
             # Available completed member events with media
@@ -975,10 +1041,6 @@ class AnalysisWorker:
             ann_gen = job.annotation_generation or 1
 
             # Group available events by unique camera visual view
-            # Uses resource_key if available; falls back to source_id (non-camera imports),
-            # or event_id if neither is present.
-            # Two events from the same physical camera = ONE view.
-            # Two sources without camera IDs are still two distinct declared views.
             views_map: dict[str, list[Any]] = {}
             for ev in available_events:
                 r_key = getattr(ev, "resource_key", None)
@@ -1018,7 +1080,7 @@ class AnalysisWorker:
                     profile_digest=job.profile_digest,
                 )
                 await self._fusion_job_store.skip_fusion_job(
-                    job.id, job.generation, "INSUFFICIENT_VIEWS"
+                    job.id, job.generation, "INSUFFICIENT_VIEWS", claim_token=job.claim_token
                 )
                 return
 
@@ -1047,7 +1109,7 @@ class AnalysisWorker:
                     profile_digest=job.profile_digest,
                 )
                 await self._fusion_job_store.skip_fusion_job(
-                    job.id, job.generation, "TOO_MANY_VIEWS_FOR_BUDGET"
+                    job.id, job.generation, "TOO_MANY_VIEWS_FOR_BUDGET", claim_token=job.claim_token
                 )
                 return
 
@@ -1186,7 +1248,7 @@ class AnalysisWorker:
             # Check input freshness and job currency immediately BEFORE calling provider HTTP
             async with self.incident_lock(job.incident_id):
                 if not await self._fusion_job_store.is_fusion_job_current(
-                    job.id, job.generation
+                    job.id, job.generation, claim_token=job.claim_token
                 ):
                     _LOGGER.info(
                         "Fusion job %s superseded during extraction; aborting before provider",
@@ -1204,7 +1266,9 @@ class AnalysisWorker:
                         job.input_token,
                         getattr(inputs_now, "input_token", None),
                     )
-                    await self._fusion_job_store.supersede_fusion_job(job.id, job.generation)
+                    await self._fusion_job_store.supersede_fusion_job(
+                        job.id, job.generation, claim_token=job.claim_token
+                    )
                     return
 
             # Call provider
@@ -1219,7 +1283,7 @@ class AnalysisWorker:
             # CAS commit
             async with self.incident_lock(job.incident_id):
                 if not await self._fusion_job_store.is_fusion_job_current(
-                    job.id, job.generation
+                    job.id, job.generation, claim_token=job.claim_token
                 ):
                     return
 
@@ -1246,12 +1310,16 @@ class AnalysisWorker:
                     profile_digest=job.profile_digest,
                 )
                 if cas_ok:
-                    await self._fusion_job_store.complete_fusion_job(job.id, job.generation)
+                    await self._fusion_job_store.complete_fusion_job(
+                        job.id, job.generation, claim_token=job.claim_token
+                    )
                 else:
                     _LOGGER.warning(
                         "CAS commit failed for fusion job %s; superseding", job.incident_id
                     )
-                    await self._fusion_job_store.supersede_fusion_job(job.id, job.generation)
+                    await self._fusion_job_store.supersede_fusion_job(
+                        job.id, job.generation, claim_token=job.claim_token
+                    )
         finally:
             await self._cleanup_media_pins(pins)
 
@@ -1285,11 +1353,20 @@ class AnalysisWorker:
         if retryable and (job.attempts + 1) < job_max_attempts:
             backoff = BASE_BACKOFF_SECONDS * (2**job.attempts)
             await self._fusion_job_store.fail_fusion_job(
-                job.id, job.generation, err_code, retryable=True, backoff_seconds=backoff
+                job.id,
+                job.generation,
+                err_code,
+                retryable=True,
+                backoff_seconds=backoff,
+                claim_token=job.claim_token,
             )
         else:
             transitioned = await self._fusion_job_store.fail_fusion_job(
-                job.id, job.generation, err_code, retryable=False
+                job.id,
+                job.generation,
+                err_code,
+                retryable=False,
+                claim_token=job.claim_token,
             )
             if transitioned:
                 # The store transition confirms this generation was still leased;
@@ -1320,466 +1397,5 @@ class AnalysisWorker:
                         )
 
 
-class VisionCoordinator:
-    """Manages catchup scanning, subscription dispatch, and manual retry for event_vision."""
-
-    def __init__(
-        self,
-        job_store: AnalysisJobStore,
-        worker: AnalysisWorker,
-        recording_api: Any,
-        auto_analyze: bool = True,
-        model: str = "gemini-flash-lite-latest",
-        prompt_instructions: str | None = None,
-        max_frames: int = DEFAULT_MAX_FRAMES,
-        sampling_policy: str = DEFAULT_SAMPLING_POLICY,
-        job_deadline: float = DEFAULT_JOB_DEADLINE,
-        provider_timeout: float = DEFAULT_PROVIDER_TIMEOUT,
-        extraction_timeout: float = DEFAULT_EXTRACTION_TIMEOUT,
-        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
-        fusion_job_store: FusionJobStore | None = None,
-        enable_fusion: bool = DEFAULT_ENABLE_FUSION,
-        fusion_max_frames: int = DEFAULT_FUSION_MAX_FRAMES,
-        fusion_prompt_instructions: str | None = None,
-        fusion_job_deadline: float = DEFAULT_FUSION_JOB_DEADLINE,
-    ) -> None:
-        self.job_store = job_store
-        self.fusion_job_store = fusion_job_store
-        self.worker = worker
-        self.rec_api = recording_api
-        self.auto_analyze = auto_analyze
-        self.model = model
-        self.prompt_instructions = prompt_instructions
-        self.max_frames = max(MIN_FRAMES, min(max_frames, MAX_FRAMES_BUDGET))
-        self.sampling_policy = (
-            sampling_policy
-            if sampling_policy in VALID_SAMPLING_POLICIES
-            else DEFAULT_SAMPLING_POLICY
-        )
-        self.job_deadline = job_deadline
-        self.provider_timeout = provider_timeout
-        self.extraction_timeout = extraction_timeout
-        self.max_attempts = max_attempts
-
-        self.enable_fusion = bool(enable_fusion)
-        self.fusion_max_frames = max(
-            MIN_FUSION_MAX_FRAMES, min(int(fusion_max_frames), MAX_FUSION_MAX_FRAMES)
-        )
-        self.fusion_prompt_instructions = fusion_prompt_instructions or ""
-        self.fusion_job_deadline = float(fusion_job_deadline)
-
-        self._unsub_recording: Any = None
-        self._unsub_incidents: Any = None
-        self._unsub_consumer: Any = None
-        self._notification_tasks: set[asyncio.Task[None]] = set()
-
-    def _get_event_lock(self, event_id: str) -> asyncio.Lock:
-        return self.worker.event_lock(event_id)
-
-    def _get_incident_lock(self, incident_id: str) -> asyncio.Lock:
-        return self.worker.incident_lock(incident_id)
-
-    @property
-    def profile_payload(self) -> str:
-        """Return canonical JSON profile payload with semantic and operational budget snapshot."""
-        payload = build_job_payload(
-            model=self.model,
-            instructions=self.prompt_instructions,
-            max_frames=self.max_frames,
-            sampling_policy=self.sampling_policy,
-            base_prompt=GENERIC_MEDIA_PROMPT,
-            job_deadline=self.job_deadline,
-            provider_timeout=self.provider_timeout,
-            extraction_timeout=self.extraction_timeout,
-            max_attempts=self.max_attempts,
-        )
-        return canonical_profile_json(payload)
-
-    @property
-    def profile_digest(self) -> str:
-        """Return profile digest including all actual semantic sampling and analysis settings."""
-        return compute_profile_digest(
-            model=self.model,
-            instructions=self.prompt_instructions,
-            max_frames=self.max_frames,
-            sampling_policy=self.sampling_policy,
-        )
-
-    @property
-    def fusion_profile_payload(self) -> str:
-        """Return canonical JSON profile payload for fusion jobs."""
-        payload = build_fusion_job_payload(
-            model=self.model,
-            instructions=self.fusion_prompt_instructions,
-            max_frames=self.fusion_max_frames,
-            sampling_policy=self.sampling_policy,
-            fusion_prompt=DEFAULT_FUSION_PROMPT,
-            job_deadline=self.fusion_job_deadline,
-            provider_timeout=self.provider_timeout,
-            extraction_timeout=self.extraction_timeout,
-            max_attempts=self.max_attempts,
-        )
-        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
-
-    @property
-    def fusion_profile_digest(self) -> str:
-        """Return deterministic fusion profile digest."""
-        return compute_fusion_profile_digest(
-            model=self.model,
-            instructions=self.fusion_prompt_instructions,
-            max_frames=self.fusion_max_frames,
-            sampling_policy=self.sampling_policy,
-            fusion_prompt=DEFAULT_FUSION_PROMPT,
-        )
-
-    def bind_recording_api(self, rec_api: Any, available: bool = True) -> None:
-        """Bind or rebind recording API facade and setup subscriptions cleanly."""
-        self.unbind_recording_api()
-        self.rec_api = rec_api
-        self.worker.set_recording_api(rec_api)
-
-        async def async_consumer_retry(event_id: str) -> bool:
-            return await self.async_manual_analyze(event_id)
-
-        async def _is_consumer_busy() -> bool:
-            event_busy = await self.job_store.has_pending_or_leased_jobs()
-            fusion_busy = (
-                await self.fusion_job_store.has_pending_or_leased_jobs()
-                if self.fusion_job_store
-                else False
-            )
-            active_busy = len(self.worker.background_tasks) > 0
-            return event_busy or fusion_busy or active_busy
-
-        self._unsub_consumer = rec_api.register_consumer(
-            consumer_id=CONSUMER_ID,
-            retry_callback=async_consumer_retry,
-            available=available,
-            is_busy=_is_consumer_busy,
-        )
-
-        def _on_event_change(event_id: str, revision: int) -> None:
-            task = asyncio.create_task(self.async_handle_event_notification(event_id, revision))
-            self._notification_tasks.add(task)
-            task.add_done_callback(self._notification_tasks.discard)
-
-        self._unsub_recording = rec_api.subscribe(_on_event_change)
-
-        if hasattr(rec_api, "subscribe_incidents"):
-            def _on_incident_change(incident_id: str, revision: int) -> None:
-                task = asyncio.create_task(
-                    self.async_handle_incident_notification(incident_id, revision)
-                )
-                self._notification_tasks.add(task)
-                task.add_done_callback(self._notification_tasks.discard)
-
-            self._unsub_incidents = rec_api.subscribe_incidents(_on_incident_change)
-
-    def unbind_recording_api(self) -> None:
-        """Unbind and unsubscribe from recording API facade."""
-        if self._unsub_recording:
-            try:
-                self._unsub_recording()
-            except Exception:
-                pass
-            self._unsub_recording = None
-
-        if self._unsub_incidents:
-            try:
-                self._unsub_incidents()
-            except Exception:
-                pass
-            self._unsub_incidents = None
-
-        if self._unsub_consumer:
-            try:
-                self._unsub_consumer()
-            except Exception:
-                pass
-            self._unsub_consumer = None
-
-    def check_and_rebind_recording_api(self, current_api: Any, available: bool = True) -> bool:
-        """Rebind if recording API instance has changed."""
-        if current_api is not None and current_api is not self.rec_api:
-            _LOGGER.info("Recording API instance replaced; rebinding consumer and subscriptions")
-            self.bind_recording_api(current_api, available=available)
-            return True
-        return False
-
-    async def async_startup(self) -> None:
-        """Initialize worker and run startup catchup scan if auto_analyze is enabled."""
-        # Migrate pending legacy jobs to current profile without touching completed archive
-        await self.job_store.migrate_legacy_pending_jobs(
-            profile_digest=self.profile_digest,
-            profile_payload=self.profile_payload,
-        )
-        if self.fusion_job_store:
-            await self.fusion_job_store.open()
-        self.worker.start()
-
-        if self.auto_analyze:
-            await self.async_scan_unprocessed_media()
-
-    async def async_scan_unprocessed_media(self) -> int:
-        """Scan retained finalized media keyset lacking event_vision annotation.
-
-        Never performs automatic archive sweeps of already-annotated media.
-        """
-        if not self.rec_api.store.is_open:
-            return 0
-        enqueued_count = 0
-        cursor = None
-        digest = self.profile_digest
-        res_ttl = derive_reservation_ttl(self.job_deadline)
-
-        while True:
-            items, next_cursor = await self.rec_api.store.list_finalized_media(
-                cursor=cursor, limit=50, namespace_lacking=ANNOTATION_NAMESPACE
-            )
-            for item in items:
-                event_id = item["event_id"]
-                media_rev = item.get("media_revision", 1)
-                async with self._get_event_lock(event_id):
-                    # Check under lock whether this event is eligible for auto enqueue BEFORE reserving annotation
-                    if not await self.job_store.should_auto_enqueue(event_id, media_rev):
-                        continue
-
-                    # Also inspect actual event annotations to verify it lacks event_vision completion/skipping
-                    event = await self.rec_api.get_event(event_id)
-                    if not event or event.media_revision != media_rev:
-                        continue
-                    ann = event.annotations.get(ANNOTATION_NAMESPACE, {})
-                    if ann.get("status") in (STATUS_COMPLETE, STATUS_SKIPPED, STATUS_FAILED):
-                        continue
-
-                    # Reserve recording slot only when confirmed a new job will be queued
-                    ann_gen = await self.rec_api.store.reserve_annotation(
-                        event_id=event_id,
-                        namespace=ANNOTATION_NAMESPACE,
-                        expected_media_revision=media_rev,
-                        worker_id=self.worker.worker_id,
-                        ttl_seconds=res_ttl,
-                    )
-                    if ann_gen is None:
-                        continue
-
-                    _, enqueued = await self.job_store.enqueue_job(
-                        event_id=event_id,
-                        media_revision=media_rev,
-                        profile_digest=digest,
-                        is_manual=False,
-                        annotation_generation=ann_gen,
-                        profile_payload=self.profile_payload,
-                    )
-                    if enqueued:
-                        enqueued_count += 1
-
-            if not next_cursor or not items:
-                break
-            cursor = next_cursor
-
-        if enqueued_count > 0:
-            self.worker.notify()
-
-        return enqueued_count
-
-    async def async_handle_event_notification(self, event_id: str, revision: int) -> None:
-        """Handle post-commit recording subscription update without infinite loop."""
-        if not self.rec_api.store.is_open:
-            return
-
-        if self.auto_analyze:
-            async with self._get_event_lock(event_id):
-                event = await self.rec_api.get_event(event_id)
-                if event and event.capture_state in ("ready", "partial"):
-                    ann_dict = event.annotations.get(ANNOTATION_NAMESPACE, {})
-                    should_enqueue = True
-                    if ann_dict:
-                        ann_status = ann_dict.get("status")
-                        ann_media_rev = ann_dict.get("media_revision")
-                        if (
-                            ann_status in (STATUS_COMPLETE, STATUS_SKIPPED, STATUS_FAILED)
-                            and ann_media_rev == event.media_revision
-                        ):
-                            should_enqueue = False
-
-                    if should_enqueue and await self.job_store.should_auto_enqueue(
-                        event_id, event.media_revision
-                    ):
-                        res_ttl = derive_reservation_ttl(self.job_deadline)
-                        ann_gen = await self.rec_api.store.reserve_annotation(
-                            event_id=event_id,
-                            namespace=ANNOTATION_NAMESPACE,
-                            expected_media_revision=event.media_revision,
-                            worker_id=self.worker.worker_id,
-                            ttl_seconds=res_ttl,
-                        )
-                        if ann_gen is not None:
-                            _, enqueued = await self.job_store.enqueue_job(
-                                event_id=event_id,
-                                media_revision=event.media_revision,
-                                profile_digest=self.profile_digest,
-                                is_manual=False,
-                                annotation_generation=ann_gen,
-                                profile_payload=self.profile_payload,
-                            )
-                            if enqueued:
-                                self.worker.notify()
-
-        # Check if this event belongs to incidents and notify them to re-evaluate fusion
-        if self.enable_fusion and hasattr(self.rec_api, "list_event_incidents"):
-            try:
-                member_incidents = await self.rec_api.list_event_incidents(event_id)
-                for inc in member_incidents:
-                    task = asyncio.create_task(
-                        self.async_handle_incident_notification(
-                            inc.incident_id, inc.membership_revision
-                        )
-                    )
-                    self._notification_tasks.add(task)
-                    task.add_done_callback(self._notification_tasks.discard)
-            except Exception as err:
-                _LOGGER.warning(
-                    "Error checking incident membership for event %s: %s", event_id, err
-                )
-
-    async def async_handle_incident_notification(self, incident_id: str, revision: int) -> None:
-        """Handle post-commit incident notification to enqueue visual fusion when eligible."""
-        if not self.enable_fusion or not self.rec_api.store.is_open or not self.fusion_job_store:
-            return
-
-        async with self._get_incident_lock(incident_id):
-            inputs = await self.rec_api.get_incident_inputs(incident_id, ANNOTATION_NAMESPACE)
-            if not inputs:
-                return
-
-            incident = inputs.incident
-            ann = getattr(incident, "annotations", {}).get(ANNOTATION_NAMESPACE, {}) or {}
-            payload_status = ann.get("status")
-            if isinstance(ann.get("payload"), dict):
-                payload_status = ann["payload"].get("status", payload_status)
-            if (
-                payload_status in (STATUS_COMPLETE, STATUS_SKIPPED, STATUS_FAILED)
-                and ann.get("input_token") == inputs.input_token
-                and ann.get("profile_digest") == self.fusion_profile_digest
-            ):
-                return
-
-            # Guard queue: if job already exists for this exact input state, do not reserve or re-enqueue
-            existing_job = await self.fusion_job_store.get_job_by_inputs(
-                incident_id, inputs.input_token, self.fusion_profile_digest
-            )
-            if existing_job and existing_job.status in ("pending", "leased", "complete", "skipped", "failed"):
-                return
-
-            res_ttl = derive_reservation_ttl(self.fusion_job_deadline)
-            ann_gen = await self.rec_api.reserve_incident_annotation(
-                incident_id=incident_id,
-                namespace=ANNOTATION_NAMESPACE,
-                expected_input_token=inputs.input_token,
-                input_namespace=ANNOTATION_NAMESPACE,
-                profile_digest=self.fusion_profile_digest,
-                worker_id=self.worker.worker_id,
-                ttl_seconds=res_ttl,
-            )
-            if ann_gen is None:
-                return
-
-            _, enqueued = await self.fusion_job_store.enqueue_fusion_job(
-                incident_id=incident_id,
-                input_token=inputs.input_token,
-                profile_digest=self.fusion_profile_digest,
-                is_manual=False,
-                annotation_generation=ann_gen,
-                profile_payload=self.fusion_profile_payload,
-            )
-            if enqueued:
-                self.worker.notify()
-
-    async def async_manual_analyze(self, event_id: str) -> bool:
-        """Handle manual retry: supersedes existing generation atomically."""
-        if not self.rec_api.store.is_open:
-            return False
-        async with self._get_event_lock(event_id):
-            event = await self.rec_api.get_event(event_id)
-            if not event:
-                return False
-
-            res_ttl = derive_reservation_ttl(self.job_deadline)
-            ann_gen = await self.rec_api.store.reserve_annotation(
-                event_id=event_id,
-                namespace=ANNOTATION_NAMESPACE,
-                expected_media_revision=event.media_revision,
-                worker_id=self.worker.worker_id,
-                ttl_seconds=res_ttl,
-            )
-            if ann_gen is None:
-                _LOGGER.warning(
-                    "Failed to reserve annotation for manual analyze of event %s", event_id
-                )
-                return False
-
-            digest = self.profile_digest
-            _, enqueued = await self.job_store.enqueue_job(
-                event_id=event_id,
-                media_revision=event.media_revision,
-                profile_digest=digest,
-                is_manual=True,
-                annotation_generation=ann_gen,
-                profile_payload=self.profile_payload,
-            )
-            if enqueued:
-                self.worker.notify()
-            return enqueued
-
-    async def async_manual_analyze_incident(self, incident_id: str) -> bool:
-        """Handle manual retry for incident: reserves annotation and enqueues manual job."""
-        if not self.enable_fusion or not self.rec_api.store.is_open or not self.fusion_job_store:
-            return False
-
-        async with self._get_incident_lock(incident_id):
-            inputs = await self.rec_api.get_incident_inputs(incident_id, ANNOTATION_NAMESPACE)
-            if not inputs:
-                return False
-
-            res_ttl = derive_reservation_ttl(self.fusion_job_deadline)
-            ann_gen = await self.rec_api.reserve_incident_annotation(
-                incident_id=incident_id,
-                namespace=ANNOTATION_NAMESPACE,
-                expected_input_token=inputs.input_token,
-                input_namespace=ANNOTATION_NAMESPACE,
-                profile_digest=self.fusion_profile_digest,
-                worker_id=self.worker.worker_id,
-                ttl_seconds=res_ttl,
-            )
-            if ann_gen is None:
-                _LOGGER.warning(
-                    "Failed to reserve annotation for manual analyze of incident %s", incident_id
-                )
-                return False
-
-            _, enqueued = await self.fusion_job_store.enqueue_fusion_job(
-                incident_id=incident_id,
-                input_token=inputs.input_token,
-                profile_digest=self.fusion_profile_digest,
-                is_manual=True,
-                annotation_generation=ann_gen,
-                profile_payload=self.fusion_profile_payload,
-            )
-            if enqueued:
-                self.worker.notify()
-            return enqueued
-
-    async def async_shutdown(self) -> None:
-        """Cleanly unsubscribe, cancel background tasks, and stop worker."""
-        self.unbind_recording_api()
-        for t in list(self._notification_tasks):
-            if not t.done():
-                t.cancel()
-        if self._notification_tasks:
-            await asyncio.gather(*self._notification_tasks, return_exceptions=True)
-            self._notification_tasks.clear()
-        await self.worker.stop()
-        await self.job_store.close()
-        if self.fusion_job_store:
-            await self.fusion_job_store.close()
+# Re-export VisionCoordinator from .coordinator for backward-compatible imports and test seams
+from .coordinator import VisionCoordinator as VisionCoordinator  # noqa: E402

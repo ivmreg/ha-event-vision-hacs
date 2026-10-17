@@ -19,7 +19,10 @@ from custom_components.event_recording.core.models import (
 
 from ..const import (
     CAS_CLEANUP_MARGIN_SECONDS,
+    DEFAULT_CONCURRENCY,
     DEFAULT_EXTRACTION_TIMEOUT,
+    DEFAULT_FRAME_CACHE_MB,
+    DEFAULT_FRAME_CACHE_TTL,
     DEFAULT_FUSION_JOB_DEADLINE,
     DEFAULT_FUSION_MAX_FRAMES,
     DEFAULT_FUSION_PROMPT,
@@ -31,23 +34,178 @@ from ..const import (
     DEFAULT_SAMPLING_POLICY,
     GENERIC_MEDIA_PROMPT,
     MAX_ATTEMPTS_BOUND,
+    MAX_CONCURRENCY,
     MAX_EXTRACTION_TIMEOUT,
+    MAX_FRAME_CACHE_MB,
+    MAX_FRAME_CACHE_TTL,
     MAX_FRAMES_BUDGET,
     MAX_FUSION_JOB_DEADLINE,
     MAX_FUSION_MAX_FRAMES,
     MAX_IMAGE_SOURCE_BYTES,
+    MAX_JOB_DEADLINE,
     MAX_OBJECT_LEN,
     MAX_OBJECTS,
     MAX_PROVIDER_TIMEOUT,
     MAX_SUMMARY_LEN,
     MIN_ATTEMPTS,
+    MIN_CONCURRENCY,
     MIN_EXTRACTION_TIMEOUT,
+    MIN_FRAME_CACHE_MB,
+    MIN_FRAME_CACHE_TTL,
     MIN_FRAMES,
     MIN_FUSION_JOB_DEADLINE,
     MIN_FUSION_MAX_FRAMES,
+    MIN_JOB_DEADLINE,
     MIN_PROVIDER_TIMEOUT,
     VALID_SAMPLING_POLICIES,
     VALID_STATUSES,
+)
+
+try:
+    from custom_components.event_recording.core.validation import (
+        FieldSpec,
+        IdSpec,
+        NumberSpec,
+        StringSpec,
+        ValidationError,
+        validate_bounded_string,
+        validate_number,
+        validate_safe_id,
+    )
+except ImportError:
+    try:
+        from ...event_recording.core.validation import (  # noqa: F401
+            FieldSpec,
+            IdSpec,
+            NumberSpec,
+            StringSpec,
+            ValidationError,
+            validate_bounded_string,
+            validate_number,
+            validate_safe_id,
+        )
+    except ImportError:
+        class ValidationError(ValueError):  # type: ignore[no-redef]
+            pass
+
+        @dataclass(frozen=True, slots=True)
+        class FieldSpec:  # type: ignore[no-redef]
+            name: str
+            allow_none: bool = False
+            default: Any = None
+
+            def validate(self, val: Any) -> Any:
+                raise NotImplementedError
+
+        @dataclass(frozen=True, slots=True)
+        class NumberSpec(FieldSpec):  # type: ignore[no-redef]
+            min_val: float | int | None = None
+            max_val: float | int | None = None
+            is_integer: bool = False
+            integer: bool = False
+            allow_zero: bool = True
+            default: float | int | None = None
+
+            def validate(self, val: Any) -> float | int | None:
+                if val is None:
+                    if self.allow_none:
+                        return self.default
+                    raise ValidationError(f"{self.name} cannot be None")
+                if isinstance(val, bool) or not isinstance(val, (int, float)):
+                    raise ValidationError(
+                        f"{self.name} must be a number, got {type(val).__name__}"
+                    )
+                try:
+                    num_float = float(val)
+                except OverflowError as err:
+                    raise ValidationError(f"{self.name} too large") from err
+                if not math.isfinite(num_float):
+                    raise ValidationError(f"{self.name} must be finite")
+                if self.is_integer or self.integer:
+                    if isinstance(val, float) and not val.is_integer():
+                        raise ValidationError(f"{self.name} must be an integer")
+                    result = int(val)
+                else:
+                    result = float(val) if isinstance(val, int) else val
+                if not self.allow_zero and result == 0:
+                    raise ValidationError(f"{self.name} cannot be zero")
+                if self.min_val is not None and result < self.min_val:
+                    raise ValidationError(f"{self.name} must be >= {self.min_val}")
+                if self.max_val is not None and result > self.max_val:
+                    raise ValidationError(f"{self.name} must be <= {self.max_val}")
+                return result
+
+
+# Canonical shared declarative specifications for Event Vision
+SPEC_CONCURRENCY = NumberSpec(
+    name="concurrency",
+    min_val=MIN_CONCURRENCY,
+    max_val=MAX_CONCURRENCY,
+    is_integer=True,
+    default=DEFAULT_CONCURRENCY,
+)
+SPEC_MAX_FRAMES = NumberSpec(
+    name="max_frames",
+    min_val=MIN_FRAMES,
+    max_val=MAX_FRAMES_BUDGET,
+    is_integer=True,
+    default=DEFAULT_MAX_FRAMES,
+)
+SPEC_JOB_DEADLINE = NumberSpec(
+    name="job_deadline",
+    min_val=MIN_JOB_DEADLINE,
+    max_val=MAX_JOB_DEADLINE,
+    is_integer=False,
+    default=DEFAULT_JOB_DEADLINE,
+)
+SPEC_PROVIDER_TIMEOUT = NumberSpec(
+    name="provider_timeout",
+    min_val=MIN_PROVIDER_TIMEOUT,
+    max_val=MAX_PROVIDER_TIMEOUT,
+    is_integer=False,
+    default=DEFAULT_PROVIDER_TIMEOUT,
+)
+SPEC_EXTRACTION_TIMEOUT = NumberSpec(
+    name="extraction_timeout",
+    min_val=MIN_EXTRACTION_TIMEOUT,
+    max_val=MAX_EXTRACTION_TIMEOUT,
+    is_integer=False,
+    default=DEFAULT_EXTRACTION_TIMEOUT,
+)
+SPEC_MAX_ATTEMPTS = NumberSpec(
+    name="max_attempts",
+    min_val=MIN_ATTEMPTS,
+    max_val=MAX_ATTEMPTS_BOUND,
+    is_integer=True,
+    default=DEFAULT_MAX_ATTEMPTS,
+)
+SPEC_FUSION_JOB_DEADLINE = NumberSpec(
+    name="fusion_job_deadline",
+    min_val=MIN_FUSION_JOB_DEADLINE,
+    max_val=MAX_FUSION_JOB_DEADLINE,
+    is_integer=False,
+    default=DEFAULT_FUSION_JOB_DEADLINE,
+)
+SPEC_FUSION_MAX_FRAMES = NumberSpec(
+    name="fusion_max_frames",
+    min_val=MIN_FUSION_MAX_FRAMES,
+    max_val=MAX_FUSION_MAX_FRAMES,
+    is_integer=True,
+    default=DEFAULT_FUSION_MAX_FRAMES,
+)
+SPEC_FRAME_CACHE_MB = NumberSpec(
+    name="frame_cache_mb",
+    min_val=MIN_FRAME_CACHE_MB,
+    max_val=MAX_FRAME_CACHE_MB,
+    is_integer=True,
+    default=DEFAULT_FRAME_CACHE_MB,
+)
+SPEC_FRAME_CACHE_TTL = NumberSpec(
+    name="frame_cache_ttl",
+    min_val=MIN_FRAME_CACHE_TTL,
+    max_val=MAX_FRAME_CACHE_TTL,
+    is_integer=False,
+    default=DEFAULT_FRAME_CACHE_TTL,
 )
 
 
@@ -186,17 +344,10 @@ def validate_profile_payload(
         raise AnalysisError("INVALID_PROFILE", "Invalid or missing model in snapshot", retryable=False)
     model = model.strip()
 
-    raw_frames = data.get("max_frames")
-    if (
-        isinstance(raw_frames, bool)
-        or not isinstance(raw_frames, (int, float))
-        or not math.isfinite(raw_frames)
-        or (isinstance(raw_frames, float) and not raw_frames.is_integer())
-    ):
-        raise AnalysisError("INVALID_PROFILE", f"Invalid max_frames in snapshot: {raw_frames}", retryable=False)
-    max_frames = int(raw_frames)
-    if not (MIN_FRAMES <= max_frames <= MAX_FRAMES_BUDGET):
-        raise AnalysisError("INVALID_PROFILE", f"max_frames out of bounds [3, 16]: {max_frames}", retryable=False)
+    try:
+        max_frames = int(SPEC_MAX_FRAMES.validate(data.get("max_frames")))
+    except (ValidationError, ValueError, TypeError) as err:
+        raise AnalysisError("INVALID_PROFILE", f"Invalid max_frames in snapshot: {err}", retryable=False) from err
 
     sampling_policy = data.get("sampling_policy")
     if not isinstance(sampling_policy, str) or sampling_policy not in VALID_SAMPLING_POLICIES:
@@ -292,6 +443,34 @@ def derive_queue_lease_seconds(
     return float(job_deadline + cas_margin + 30.0)
 
 
+def _validate_spec_for_budget(
+    spec: NumberSpec, val: Any, unit: str = ""
+) -> tuple[bool, float | int | None, str | None]:
+    """Validate a budget field against its canonical NumberSpec."""
+    try:
+        res = spec.validate(val)
+        return True, res, None
+    except (ValidationError, ValueError, TypeError) as err:
+        msg = str(err)
+        if (
+            ("must be >=" in msg or "must be <=" in msg)
+            and spec.min_val is not None
+            and spec.max_val is not None
+        ):
+            min_str = (
+                f"{int(spec.min_val)}{unit}"
+                if float(spec.min_val).is_integer()
+                else f"{spec.min_val}{unit}"
+            )
+            max_str = (
+                f"{int(spec.max_val)}{unit}"
+                if float(spec.max_val).is_integer()
+                else f"{spec.max_val}{unit}"
+            )
+            return False, None, f"{spec.name} must be between {min_str} and {max_str} ({msg})"
+        return False, None, msg
+
+
 def validate_budget_bounds(
     job_deadline: Any,
     provider_timeout: Any,
@@ -301,43 +480,23 @@ def validate_budget_bounds(
     cas_margin: float = CAS_CLEANUP_MARGIN_SECONDS,
 ) -> tuple[bool, str | None]:
     """Ensure selected budget can fit worst-case sequential extraction + provider timeout + CAS margin."""
-    for val, name in (
-        (job_deadline, "job_deadline"),
-        (provider_timeout, "provider_timeout"),
-        (extraction_timeout, "extraction_timeout"),
-        (max_frames, "max_frames"),
-        (max_attempts, "max_attempts"),
+    checked: dict[str, Any] = {}
+    for spec, raw_val, unit in (
+        (SPEC_JOB_DEADLINE, job_deadline, "s"),
+        (SPEC_PROVIDER_TIMEOUT, provider_timeout, "s"),
+        (SPEC_EXTRACTION_TIMEOUT, extraction_timeout, "s"),
+        (SPEC_MAX_FRAMES, max_frames, ""),
+        (SPEC_MAX_ATTEMPTS, max_attempts, ""),
     ):
-        if isinstance(val, bool):
-            return False, f"{name} must not be a boolean"
-        if not isinstance(val, (int, float)):
-            return False, f"{name} must be a number, got {type(val).__name__}"
-        if not math.isfinite(val):
-            return False, f"{name} must be finite"
+        ok, clean_val, err = _validate_spec_for_budget(spec, raw_val, unit=unit)
+        if not ok:
+            return False, err
+        checked[spec.name] = clean_val
 
-    # Integer fields validation: no fractional silent truncation
-    if isinstance(max_frames, float) and not max_frames.is_integer():
-        return False, f"max_frames must be an integer, got {max_frames}"
-    max_frames_int = int(max_frames)
-
-    if isinstance(max_attempts, float) and not max_attempts.is_integer():
-        return False, f"max_attempts must be an integer, got {max_attempts}"
-    max_attempts_int = int(max_attempts)
-
-    deadline_float = float(job_deadline)
-    provider_float = float(provider_timeout)
-    extraction_float = float(extraction_timeout)
-
-    if deadline_float < 60.0 or deadline_float > 600.0:
-        return False, f"job_deadline must be between 60s and 600s, got {deadline_float}s"
-    if provider_float < 10.0 or provider_float > 180.0:
-        return False, f"provider_timeout must be between 10s and 180s, got {provider_float}s"
-    if extraction_float < 2.0 or extraction_float > 30.0:
-        return False, f"extraction_timeout must be between 2s and 30s, got {extraction_float}s"
-    if max_frames_int < 3 or max_frames_int > 16:
-        return False, f"max_frames must be between 3 and 16, got {max_frames_int}"
-    if max_attempts_int < 1 or max_attempts_int > 5:
-        return False, f"max_attempts must be between 1 and 5, got {max_attempts_int}"
+    deadline_float = float(checked["job_deadline"])
+    provider_float = float(checked["provider_timeout"])
+    extraction_float = float(checked["extraction_timeout"])
+    max_frames_int = int(checked["max_frames"])
 
     # Sequential worst-case bound: max_frames * extraction_timeout + provider_timeout + cas_margin
     min_required = (max_frames_int * extraction_float) + provider_float + cas_margin
@@ -360,43 +519,23 @@ def validate_fusion_budget_bounds(
     cas_margin: float = CAS_CLEANUP_MARGIN_SECONDS,
 ) -> tuple[bool, str | None]:
     """Ensure selected fusion budget can fit multi-camera extraction + provider timeout + CAS margin."""
-    for val, name in (
-        (fusion_job_deadline, "fusion_job_deadline"),
-        (fusion_max_frames, "fusion_max_frames"),
-        (provider_timeout, "provider_timeout"),
-        (extraction_timeout, "extraction_timeout"),
-        (max_attempts, "max_attempts"),
+    checked: dict[str, Any] = {}
+    for spec, raw_val, unit in (
+        (SPEC_FUSION_JOB_DEADLINE, fusion_job_deadline, "s"),
+        (SPEC_FUSION_MAX_FRAMES, fusion_max_frames, ""),
+        (SPEC_PROVIDER_TIMEOUT, provider_timeout, "s"),
+        (SPEC_EXTRACTION_TIMEOUT, extraction_timeout, "s"),
+        (SPEC_MAX_ATTEMPTS, max_attempts, ""),
     ):
-        if isinstance(val, bool):
-            return False, f"{name} must not be a boolean"
-        if not isinstance(val, (int, float)):
-            return False, f"{name} must be a number, got {type(val).__name__}"
-        if not math.isfinite(val):
-            return False, f"{name} must be finite"
+        ok, clean_val, err = _validate_spec_for_budget(spec, raw_val, unit=unit)
+        if not ok:
+            return False, err
+        checked[spec.name] = clean_val
 
-    # Integer fields validation: no fractional silent truncation
-    if isinstance(fusion_max_frames, float) and not fusion_max_frames.is_integer():
-        return False, f"fusion_max_frames must be an integer, got {fusion_max_frames}"
-    if isinstance(max_attempts, float) and not max_attempts.is_integer():
-        return False, f"max_attempts must be an integer, got {max_attempts}"
-    fusion_frames_int = int(fusion_max_frames)
-    max_attempts_int = int(max_attempts)
-
-    deadline_float = float(fusion_job_deadline)
-    provider_float = float(provider_timeout)
-    extraction_float = float(extraction_timeout)
-
-    if not (MIN_PROVIDER_TIMEOUT <= provider_float <= MAX_PROVIDER_TIMEOUT):
-        return False, f"provider_timeout must be between {MIN_PROVIDER_TIMEOUT}s and {MAX_PROVIDER_TIMEOUT}s"
-    if not (MIN_EXTRACTION_TIMEOUT <= extraction_float <= MAX_EXTRACTION_TIMEOUT):
-        return False, f"extraction_timeout must be between {MIN_EXTRACTION_TIMEOUT}s and {MAX_EXTRACTION_TIMEOUT}s"
-    if not (MIN_ATTEMPTS <= max_attempts_int <= MAX_ATTEMPTS_BOUND):
-        return False, f"max_attempts must be between {MIN_ATTEMPTS} and {MAX_ATTEMPTS_BOUND}"
-
-    if deadline_float < MIN_FUSION_JOB_DEADLINE or deadline_float > MAX_FUSION_JOB_DEADLINE:
-        return False, f"fusion_job_deadline must be between {MIN_FUSION_JOB_DEADLINE}s and {MAX_FUSION_JOB_DEADLINE}s, got {deadline_float}s"
-    if fusion_frames_int < MIN_FUSION_MAX_FRAMES or fusion_frames_int > MAX_FUSION_MAX_FRAMES:
-        return False, f"fusion_max_frames must be between {MIN_FUSION_MAX_FRAMES} and {MAX_FUSION_MAX_FRAMES}, got {fusion_frames_int}"
+    deadline_float = float(checked["fusion_job_deadline"])
+    fusion_frames_int = int(checked["fusion_max_frames"])
+    provider_float = float(checked["provider_timeout"])
+    extraction_float = float(checked["extraction_timeout"])
 
     # Worst-case: extracting up to fusion_frames_int frames across views + provider call + CAS margin
     min_required = (fusion_frames_int * extraction_float) + provider_float + cas_margin
@@ -649,6 +788,12 @@ class AnalysisJob:
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
     profile_payload: str | None = None
+    claim_token: str | None = None
+
+    @property
+    def lease_token(self) -> str | None:
+        """Alias for claim_token providing backward and forward compatibility."""
+        return self.claim_token
 
 
 @dataclass(frozen=True)
@@ -704,6 +849,12 @@ class FusionJob:
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
     profile_payload: str | None = None
+    claim_token: str | None = None
+
+    @property
+    def lease_token(self) -> str | None:
+        """Alias for claim_token providing backward and forward compatibility."""
+        return self.claim_token
 
 
 @dataclass(frozen=True)
@@ -895,17 +1046,10 @@ def validate_fusion_profile_payload(
     if not model or len(model) > 100:
         raise AnalysisError("INVALID_PROFILE", f"Invalid model name: '{model}'", retryable=False)
 
-    raw_frames = data.get("max_frames", DEFAULT_FUSION_MAX_FRAMES)
-    if (
-        isinstance(raw_frames, bool)
-        or not isinstance(raw_frames, (int, float))
-        or not math.isfinite(raw_frames)
-        or (isinstance(raw_frames, float) and not raw_frames.is_integer())
-    ):
-        raise AnalysisError("INVALID_PROFILE", f"Invalid max_frames: {raw_frames}", retryable=False)
-    max_frames = int(raw_frames)
-    if not (MIN_FUSION_MAX_FRAMES <= max_frames <= MAX_FUSION_MAX_FRAMES):
-        raise AnalysisError("INVALID_PROFILE", f"max_frames out of bounds: {max_frames}", retryable=False)
+    try:
+        max_frames = int(SPEC_FUSION_MAX_FRAMES.validate(data.get("max_frames", DEFAULT_FUSION_MAX_FRAMES)))
+    except (ValidationError, ValueError, TypeError) as err:
+        raise AnalysisError("INVALID_PROFILE", f"Invalid max_frames: {err}", retryable=False) from err
 
     sampling_policy_raw = data.get("sampling_policy", DEFAULT_SAMPLING_POLICY)
     if not isinstance(sampling_policy_raw, str):

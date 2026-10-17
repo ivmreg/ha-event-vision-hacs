@@ -6,7 +6,6 @@ Optional generic AI analyzer for event_recording.
 from __future__ import annotations
 
 import logging
-import math
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -22,6 +21,8 @@ from .const import (
     CONF_CONCURRENCY,
     CONF_ENABLE_FUSION,
     CONF_EXTRACTION_TIMEOUT,
+    CONF_FRAME_CACHE_MB,
+    CONF_FRAME_CACHE_TTL,
     CONF_FUSION_JOB_DEADLINE,
     CONF_FUSION_MAX_FRAMES,
     CONF_FUSION_PROMPT_INSTRUCTIONS,
@@ -37,6 +38,8 @@ from .const import (
     DEFAULT_CONCURRENCY,
     DEFAULT_ENABLE_FUSION,
     DEFAULT_EXTRACTION_TIMEOUT,
+    DEFAULT_FRAME_CACHE_MB,
+    DEFAULT_FRAME_CACHE_TTL,
     DEFAULT_FUSION_JOB_DEADLINE,
     DEFAULT_FUSION_MAX_FRAMES,
     DEFAULT_FUSION_PROMPT_INSTRUCTIONS,
@@ -48,34 +51,34 @@ from .const import (
     DEFAULT_PROVIDER_TIMEOUT,
     DEFAULT_SAMPLING_POLICY,
     DOMAIN,
-    MAX_ATTEMPTS_BOUND,
-    MAX_CONCURRENCY,
-    MAX_EXTRACTION_TIMEOUT,
-    MAX_FRAMES_BUDGET,
-    MAX_FUSION_JOB_DEADLINE,
-    MAX_FUSION_MAX_FRAMES,
     MAX_FUSION_PROMPT_INSTRUCTIONS_LEN,
-    MAX_JOB_DEADLINE,
     MAX_PROMPT_INSTRUCTIONS_LEN,
-    MAX_PROVIDER_TIMEOUT,
-    MIN_ATTEMPTS,
-    MIN_CONCURRENCY,
-    MIN_EXTRACTION_TIMEOUT,
-    MIN_FRAMES,
-    MIN_FUSION_JOB_DEADLINE,
-    MIN_FUSION_MAX_FRAMES,
-    MIN_JOB_DEADLINE,
-    MIN_PROVIDER_TIMEOUT,
     SERVICE_ANALYZE,
     SERVICE_ANALYZE_INCIDENT,
     VALID_SAMPLING_POLICIES,
 )
+from .core.cache import FrameCache
+from .core.coordinator import VisionCoordinator
 from .core.extractor import FrameExtractor
 from .core.fusion_store import FusionJobStore
 from .core.gemini import GeminiClient
-from .core.models import validate_budget_bounds, validate_fusion_budget_bounds
+from .core.models import (
+    SPEC_CONCURRENCY,
+    SPEC_EXTRACTION_TIMEOUT,
+    SPEC_FRAME_CACHE_MB,
+    SPEC_FRAME_CACHE_TTL,
+    SPEC_FUSION_JOB_DEADLINE,
+    SPEC_FUSION_MAX_FRAMES,
+    SPEC_JOB_DEADLINE,
+    SPEC_MAX_ATTEMPTS,
+    SPEC_MAX_FRAMES,
+    SPEC_PROVIDER_TIMEOUT,
+    ValidationError,
+    validate_budget_bounds,
+    validate_fusion_budget_bounds,
+)
 from .core.store import AnalysisJobStore
-from .core.worker import AnalysisWorker, VisionCoordinator
+from .core.worker import AnalysisWorker
 from .services import async_register_services
 
 _LOGGER = logging.getLogger(__name__)
@@ -107,76 +110,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if len(prompt_instructions) > MAX_PROMPT_INSTRUCTIONS_LEN:
         raise ConfigEntryNotReady(f"Prompt instructions length exceeds {MAX_PROMPT_INSTRUCTIONS_LEN} characters")
 
-    # Validate raw concurrency
-    raw_concurrency = config_data.get(CONF_CONCURRENCY, DEFAULT_CONCURRENCY)
-    if (
-        isinstance(raw_concurrency, bool)
-        or not isinstance(raw_concurrency, (int, float))
-        or not math.isfinite(raw_concurrency)
-        or (isinstance(raw_concurrency, float) and not raw_concurrency.is_integer())
-        or not (MIN_CONCURRENCY <= int(raw_concurrency) <= MAX_CONCURRENCY)
-    ):
-        raise ConfigEntryNotReady("Invalid concurrency configured")
-    concurrency = int(raw_concurrency)
-
-    # Validate raw max_frames
-    raw_max_frames = config_data.get(CONF_MAX_FRAMES, DEFAULT_MAX_FRAMES)
-    if (
-        isinstance(raw_max_frames, bool)
-        or not isinstance(raw_max_frames, (int, float))
-        or not math.isfinite(raw_max_frames)
-        or (isinstance(raw_max_frames, float) and not raw_max_frames.is_integer())
-        or not (MIN_FRAMES <= int(raw_max_frames) <= MAX_FRAMES_BUDGET)
-    ):
-        raise ConfigEntryNotReady("Invalid max_frames configured")
-    max_frames = int(raw_max_frames)
+    # Validate configuration parameters against declarative NumberSpec definitions
+    try:
+        concurrency = int(SPEC_CONCURRENCY.validate(config_data.get(CONF_CONCURRENCY, DEFAULT_CONCURRENCY)))
+        max_frames = int(SPEC_MAX_FRAMES.validate(config_data.get(CONF_MAX_FRAMES, DEFAULT_MAX_FRAMES)))
+        job_deadline = float(SPEC_JOB_DEADLINE.validate(config_data.get(CONF_JOB_DEADLINE, DEFAULT_JOB_DEADLINE)))
+        provider_timeout = float(SPEC_PROVIDER_TIMEOUT.validate(config_data.get(CONF_PROVIDER_TIMEOUT, DEFAULT_PROVIDER_TIMEOUT)))
+        extraction_timeout = float(SPEC_EXTRACTION_TIMEOUT.validate(config_data.get(CONF_EXTRACTION_TIMEOUT, DEFAULT_EXTRACTION_TIMEOUT)))
+        max_attempts = int(SPEC_MAX_ATTEMPTS.validate(config_data.get(CONF_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS)))
+        fusion_max_frames = int(SPEC_FUSION_MAX_FRAMES.validate(config_data.get(CONF_FUSION_MAX_FRAMES, DEFAULT_FUSION_MAX_FRAMES)))
+        fusion_job_deadline = float(SPEC_FUSION_JOB_DEADLINE.validate(config_data.get(CONF_FUSION_JOB_DEADLINE, DEFAULT_FUSION_JOB_DEADLINE)))
+        cache_mb = int(SPEC_FRAME_CACHE_MB.validate(config_data.get(CONF_FRAME_CACHE_MB, DEFAULT_FRAME_CACHE_MB)))
+        cache_ttl = float(SPEC_FRAME_CACHE_TTL.validate(config_data.get(CONF_FRAME_CACHE_TTL, DEFAULT_FRAME_CACHE_TTL)))
+    except (ValidationError, ValueError, TypeError) as err:
+        raise ConfigEntryNotReady(f"Invalid configuration parameter: {err}") from err
 
     # Validate sampling policy
     sampling_policy = str(config_data.get(CONF_SAMPLING_POLICY, DEFAULT_SAMPLING_POLICY)).strip()
     if sampling_policy not in VALID_SAMPLING_POLICIES:
         raise ConfigEntryNotReady(f"Invalid sampling policy '{sampling_policy}'")
-
-    # Validate raw budget fields
-    raw_deadline = config_data.get(CONF_JOB_DEADLINE, DEFAULT_JOB_DEADLINE)
-    if (
-        isinstance(raw_deadline, bool)
-        or not isinstance(raw_deadline, (int, float))
-        or not math.isfinite(raw_deadline)
-        or not (MIN_JOB_DEADLINE <= float(raw_deadline) <= MAX_JOB_DEADLINE)
-    ):
-        raise ConfigEntryNotReady("Invalid job_deadline configured")
-    job_deadline = float(raw_deadline)
-
-    raw_provider_timeout = config_data.get(CONF_PROVIDER_TIMEOUT, DEFAULT_PROVIDER_TIMEOUT)
-    if (
-        isinstance(raw_provider_timeout, bool)
-        or not isinstance(raw_provider_timeout, (int, float))
-        or not math.isfinite(raw_provider_timeout)
-        or not (MIN_PROVIDER_TIMEOUT <= float(raw_provider_timeout) <= MAX_PROVIDER_TIMEOUT)
-    ):
-        raise ConfigEntryNotReady("Invalid provider_timeout configured")
-    provider_timeout = float(raw_provider_timeout)
-
-    raw_extraction_timeout = config_data.get(CONF_EXTRACTION_TIMEOUT, DEFAULT_EXTRACTION_TIMEOUT)
-    if (
-        isinstance(raw_extraction_timeout, bool)
-        or not isinstance(raw_extraction_timeout, (int, float))
-        or not math.isfinite(raw_extraction_timeout)
-        or not (MIN_EXTRACTION_TIMEOUT <= float(raw_extraction_timeout) <= MAX_EXTRACTION_TIMEOUT)
-    ):
-        raise ConfigEntryNotReady("Invalid extraction_timeout configured")
-    extraction_timeout = float(raw_extraction_timeout)
-
-    raw_max_attempts = config_data.get(CONF_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS)
-    if (
-        isinstance(raw_max_attempts, bool)
-        or not isinstance(raw_max_attempts, (int, float))
-        or not math.isfinite(raw_max_attempts)
-        or (isinstance(raw_max_attempts, float) and not raw_max_attempts.is_integer())
-        or not (MIN_ATTEMPTS <= int(raw_max_attempts) <= MAX_ATTEMPTS_BOUND)
-    ):
-        raise ConfigEntryNotReady("Invalid max_attempts configured")
-    max_attempts = int(raw_max_attempts)
 
     # Validate coupled budget bounds
     valid_budget, err_msg = validate_budget_bounds(
@@ -196,32 +148,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     auto_analyze = raw_auto_analyze if has_valid_key else False
 
     enable_fusion = bool(config_data.get(CONF_ENABLE_FUSION, DEFAULT_ENABLE_FUSION))
-    raw_fusion_frames = config_data.get(CONF_FUSION_MAX_FRAMES, DEFAULT_FUSION_MAX_FRAMES)
-    if (
-        isinstance(raw_fusion_frames, bool)
-        or not isinstance(raw_fusion_frames, (int, float))
-        or not math.isfinite(raw_fusion_frames)
-        or (isinstance(raw_fusion_frames, float) and not raw_fusion_frames.is_integer())
-        or not (MIN_FUSION_MAX_FRAMES <= int(raw_fusion_frames) <= MAX_FUSION_MAX_FRAMES)
-    ):
-        raise ConfigEntryNotReady("Invalid fusion_max_frames configured")
-    fusion_max_frames = int(raw_fusion_frames)
-
     fusion_instructions = str(
         config_data.get(CONF_FUSION_PROMPT_INSTRUCTIONS, DEFAULT_FUSION_PROMPT_INSTRUCTIONS)
     ).strip()
     if len(fusion_instructions) > MAX_FUSION_PROMPT_INSTRUCTIONS_LEN:
         raise ConfigEntryNotReady(f"Fusion instructions length exceeds {MAX_FUSION_PROMPT_INSTRUCTIONS_LEN} characters")
-
-    raw_fusion_deadline = config_data.get(CONF_FUSION_JOB_DEADLINE, DEFAULT_FUSION_JOB_DEADLINE)
-    if (
-        isinstance(raw_fusion_deadline, bool)
-        or not isinstance(raw_fusion_deadline, (int, float))
-        or not math.isfinite(raw_fusion_deadline)
-        or not (MIN_FUSION_JOB_DEADLINE <= float(raw_fusion_deadline) <= MAX_FUSION_JOB_DEADLINE)
-    ):
-        raise ConfigEntryNotReady("Invalid fusion_job_deadline configured")
-    fusion_job_deadline = float(raw_fusion_deadline)
 
     valid_fusion_budget, fusion_err_msg = validate_fusion_budget_bounds(
         fusion_job_deadline=fusion_job_deadline,
@@ -241,8 +172,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     fusion_job_store = FusionJobStore(fusion_db_path, max_attempts=max_attempts)
     await fusion_job_store.open()
 
+    frame_cache = FrameCache(max_bytes=cache_mb * 1024 * 1024, ttl_seconds=cache_ttl)
+
     gemini_client = GeminiClient(api_key=api_key if has_valid_key else "", model=model)
-    frame_extractor = FrameExtractor(ffmpeg_bin=getattr(rec_api, "ffmpeg_binary", None))
+    frame_extractor = FrameExtractor(ffmpeg_bin=getattr(rec_api, "ffmpeg_binary", None), cache=frame_cache)
 
     worker = AnalysisWorker(
         job_store=job_store,
@@ -264,6 +197,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         fusion_max_frames=fusion_max_frames,
         fusion_prompt_instructions=fusion_instructions if fusion_instructions else None,
         fusion_job_deadline=fusion_job_deadline,
+        cache=frame_cache,
     )
 
     coordinator = VisionCoordinator(
@@ -320,6 +254,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "gemini_client": gemini_client,
             "worker": worker,
             "coordinator": coordinator,
+            "frame_cache": frame_cache,
             "unsub_periodic": unsub_periodic,
         }
 
@@ -328,7 +263,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 unsub_periodic()
             await coordinator.async_shutdown()
             await gemini_client.close()
+            await job_store.close()
             await fusion_job_store.close()
+            await frame_cache.clear()
 
         entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, on_stop))
 
@@ -349,6 +286,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await gemini_client.close()
         await job_store.close()
         await fusion_job_store.close()
+        await frame_cache.clear()
         raise
 
     return True
@@ -375,6 +313,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if coordinator:
             await coordinator.async_shutdown()
 
+        job_store: AnalysisJobStore = entry_data.get("job_store")
+        if job_store:
+            await job_store.close()
+
         fusion_job_store: FusionJobStore = entry_data.get("fusion_job_store")
         if fusion_job_store:
             await fusion_job_store.close()
@@ -382,6 +324,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         gemini_client: GeminiClient = entry_data.get("gemini_client")
         if gemini_client:
             await gemini_client.close()
+
+        frame_cache: FrameCache = entry_data.get("frame_cache")
+        if frame_cache:
+            await frame_cache.clear()
 
     entries = hass.data.get(DOMAIN, {}).get("entries", {})
     if not entries:

@@ -2,7 +2,7 @@
 
 Optional direct Gemini analysis of finalized Event Recording events. Its durable queue is separate from recording. Cloud failures and analysis retries do not block event intake or capture. This integration has no LLMVision dependency.
 
-Requires Home Assistant **2026.10.1** or later. Version **0.3.0**.
+Requires Home Assistant **2026.10.1** or later. Version **0.4.0**.
 
 ## HACS custom repository
 

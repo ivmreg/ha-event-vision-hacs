@@ -17,10 +17,15 @@ repository. Distribution repositories must be public for standard HACS; private
 staging mirrors cannot be installed. See [HACS packaging](hacs.md) for details.
 Manual copy into `custom_components/` remains supported.
 
+> [!IMPORTANT]
+> **Version Dependency & HACS Upgrade Order:**
+> `event_vision 0.4.0` requires `event_recording >= 0.5.0` for shared declarative validation modules.
+> When updating in HACS, operators must update both **Event Recording** and **Event Vision** before restarting Home Assistant.
+
 | Component | Role | Required Dependencies | Cloud / API Key |
 |---|---|---|---|
-| **`event_recording`** | Standalone event journal, media store, streaming, card | None (works standalone) | None (100% local) |
-| **`event_vision`** | Optional AI incident analyzer | `event_recording` | Google Gemini API key |
+| **`event_recording` (0.5.0)** | Standalone event journal, media store, streaming, card | None (works standalone) | None (100% local) |
+| **`event_vision` (0.4.0)** | Optional AI incident analyzer | `event_recording >= 0.5.0` | Google Gemini API key |
 
 ---
 

@@ -17,6 +17,8 @@ from homeassistant.core import HomeAssistant
 from .const import (
     CONF_ENABLE_FUSION,
     CONF_EXTRACTION_TIMEOUT,
+    CONF_FRAME_CACHE_MB,
+    CONF_FRAME_CACHE_TTL,
     CONF_FUSION_JOB_DEADLINE,
     CONF_FUSION_MAX_FRAMES,
     CONF_FUSION_PROMPT_INSTRUCTIONS,
@@ -30,6 +32,8 @@ from .const import (
     CONF_SAMPLING_POLICY,
     DEFAULT_ENABLE_FUSION,
     DEFAULT_EXTRACTION_TIMEOUT,
+    DEFAULT_FRAME_CACHE_MB,
+    DEFAULT_FRAME_CACHE_TTL,
     DEFAULT_FUSION_JOB_DEADLINE,
     DEFAULT_FUSION_MAX_FRAMES,
     DEFAULT_FUSION_PROMPT,
@@ -43,6 +47,8 @@ from .const import (
     GENERIC_MEDIA_PROMPT,
     MAX_PROMPT_INSTRUCTIONS_LEN,
 )
+from .core.cache import FrameCache
+from .core.coordinator import VisionCoordinator
 from .core.fusion_store import FusionJobStore
 from .core.models import (
     derive_lease_pin_seconds,
@@ -50,7 +56,6 @@ from .core.models import (
     is_rolling_model_alias,
 )
 from .core.store import AnalysisJobStore
-from .core.worker import VisionCoordinator
 
 TO_REDACT = {
     CONF_GEMINI_API_KEY,
@@ -69,6 +74,7 @@ async def async_get_config_entry_diagnostics(
     job_store: AnalysisJobStore | None = entry_info.get("job_store")
     fusion_job_store: FusionJobStore | None = entry_info.get("fusion_job_store")
     coordinator: VisionCoordinator | None = entry_info.get("coordinator")
+    frame_cache: FrameCache | None = entry_info.get("frame_cache")
 
     queue_stats: dict[str, Any] = {}
     if job_store and job_store.is_open:
@@ -77,6 +83,22 @@ async def async_get_config_entry_diagnostics(
     fusion_queue_stats: dict[str, Any] = {}
     if fusion_job_store and fusion_job_store.is_open:
         fusion_queue_stats = await fusion_job_store.get_job_counts()
+
+    cache_stats: dict[str, Any] = {}
+    if frame_cache:
+        cache_stats = await frame_cache.get_diagnostics()
+    else:
+        cache_stats = {
+            "enabled": False,
+            "max_bytes": 0,
+            "ttl_seconds": 0.0,
+            "total_entries": 0,
+            "total_bytes": 0,
+            "hits": 0,
+            "misses": 0,
+            "evictions": 0,
+            "in_flight_coalesced": 0,
+        }
 
     pre_payload_backup_exists = False
     if job_store and getattr(job_store, "_db_path", None):
@@ -93,6 +115,8 @@ async def async_get_config_entry_diagnostics(
     provider_timeout = float(current_data.get(CONF_PROVIDER_TIMEOUT, DEFAULT_PROVIDER_TIMEOUT))
     extraction_timeout = float(current_data.get(CONF_EXTRACTION_TIMEOUT, DEFAULT_EXTRACTION_TIMEOUT))
     max_attempts = int(current_data.get(CONF_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS))
+    cache_mb = int(current_data.get(CONF_FRAME_CACHE_MB, DEFAULT_FRAME_CACHE_MB))
+    cache_ttl = float(current_data.get(CONF_FRAME_CACHE_TTL, DEFAULT_FRAME_CACHE_TTL))
 
     enable_fusion = bool(current_data.get(CONF_ENABLE_FUSION, DEFAULT_ENABLE_FUSION))
     fusion_max_frames = int(current_data.get(CONF_FUSION_MAX_FRAMES, DEFAULT_FUSION_MAX_FRAMES))
@@ -119,6 +143,7 @@ async def async_get_config_entry_diagnostics(
         "pre_payload_backup_exists": pre_payload_backup_exists,
         "queue_stats": queue_stats,
         "fusion_queue_stats": fusion_queue_stats,
+        "frame_cache": cache_stats,
         "profile_digest": profile_digest,
         "fusion_profile_digest": fusion_profile_digest,
         "provider_info": {
@@ -138,6 +163,8 @@ async def async_get_config_entry_diagnostics(
             "provider_timeout_seconds": provider_timeout,
             "extraction_timeout_seconds": extraction_timeout,
             "max_attempts": max_attempts,
+            "frame_cache_mb": cache_mb,
+            "frame_cache_ttl_seconds": cache_ttl,
             "derived_reservation_ttl_seconds": derive_reservation_ttl(job_deadline),
             "derived_lease_pin_seconds": derive_lease_pin_seconds(job_deadline),
         },

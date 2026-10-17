@@ -131,6 +131,17 @@ DEFAULT_FUSION_PROMPT = (
     "Output strictly valid JSON conforming to the requested schema."
 )
 
+# Extracted Frame Cache settings & bounds
+CONF_FRAME_CACHE_MB = "frame_cache_mb"
+DEFAULT_FRAME_CACHE_MB = 64
+MIN_FRAME_CACHE_MB = 0
+MAX_FRAME_CACHE_MB = 512
+
+CONF_FRAME_CACHE_TTL = "frame_cache_ttl"
+DEFAULT_FRAME_CACHE_TTL = 300.0
+MIN_FRAME_CACHE_TTL = 10.0
+MAX_FRAME_CACHE_TTL = 86400.0
+
 # Service names
 SERVICE_ANALYZE = "analyze"
 SERVICE_ANALYZE_INCIDENT = "analyze_incident"

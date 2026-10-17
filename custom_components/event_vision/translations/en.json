@@ -73,7 +73,9 @@
           "job_deadline": "Job Deadline (seconds)",
           "provider_timeout": "Provider Timeout (seconds)",
           "extraction_timeout": "Extraction Timeout (seconds)",
-          "max_attempts": "Maximum Attempts (1-5)"
+          "max_attempts": "Maximum Attempts (1-5)",
+          "frame_cache_mb": "Extracted Frame Cache Budget (MB, 0 to disable)",
+          "frame_cache_ttl": "Extracted Frame Cache TTL (seconds)"
         }
       },
       "effective": {
@@ -93,7 +95,9 @@
       "invalid_job_deadline": "Job deadline must be between 60 and 600 seconds.",
       "invalid_provider_timeout": "Provider timeout must be between 10 and 180 seconds.",
       "invalid_extraction_timeout": "Extraction timeout must be between 2 and 30 seconds.",
-      "invalid_max_attempts": "Maximum attempts must be a whole number between 1 and 5."
+      "invalid_max_attempts": "Maximum attempts must be a whole number between 1 and 5.",
+      "invalid_frame_cache_mb": "Frame cache budget must be an integer between 0 and 512 MB.",
+      "invalid_frame_cache_ttl": "Frame cache TTL must be between 10 and 86400 seconds."
     }
   },
   "entity": {

@@ -23,6 +23,7 @@ from ..const import (
     MAX_IMAGE_DIMENSION,
     MAX_IMAGE_SOURCE_BYTES,
 )
+from .cache import FrameCache, compute_source_fingerprint
 from .models import ExtractedFrame, FrameExtractionError
 
 _LOGGER = logging.getLogger(__name__)
@@ -73,8 +74,14 @@ def validate_image_bytes(data: bytes) -> str:
 class FrameExtractor:
     """Extracts anchored frames from verified media paths."""
 
-    def __init__(self, ffmpeg_bin: str | None = None) -> None:
+    def __init__(self, ffmpeg_bin: str | None = None, cache: FrameCache | None = None) -> None:
         self._ffmpeg_bin = ffmpeg_bin
+        self._cache = cache
+
+    @property
+    def cache(self) -> FrameCache | None:
+        """Return attached FrameCache instance if configured."""
+        return self._cache
 
     def _resolve_ffmpeg(self) -> str | None:
         """Resolve valid ffmpeg executable path."""
@@ -94,6 +101,8 @@ class FrameExtractor:
         media_id: str | None = None,
         timestamp_quality: str = "unknown",
         offset_quality: str = "exact",
+        media_revision: int = 1,
+        source_fingerprint: str | None = None,
     ) -> list[ExtractedFrame]:
         """Extract validated frames from an existing media file path.
 
@@ -103,6 +112,12 @@ class FrameExtractor:
             raise FrameExtractionError("MEDIA_UNAVAILABLE", f"Media file not found: {media_path.name}")
 
         max_frames = max(1, min(max_frames, MAX_FRAMES_BUDGET))
+
+        stat_res = await asyncio.to_thread(media_path.stat)
+        computed_fp = compute_source_fingerprint(media_path, stat_res)
+        if source_fingerprint is not None and source_fingerprint != computed_fp:
+            _LOGGER.debug("Caller source_fingerprint mismatch, using validated on-disk fingerprint")
+        source_fingerprint = computed_fp
 
         # Determine if media is an image
         is_image = False
@@ -114,14 +129,15 @@ class FrameExtractor:
             is_image = True
 
         if is_image:
-            size = await asyncio.to_thread(media_path.stat)
-            if size.st_size > MAX_IMAGE_SOURCE_BYTES:
+            if stat_res.st_size > MAX_IMAGE_SOURCE_BYTES:
                 raise FrameExtractionError("IMAGE_TOO_LARGE", "Image source exceeds byte limit")
             return await self._extract_image(
                 media_path,
                 media_id=media_id,
                 timestamp_quality=timestamp_quality,
                 offset_quality=offset_quality,
+                media_revision=media_revision,
+                source_fingerprint=source_fingerprint,
             )
 
         # Video frame extraction
@@ -134,6 +150,8 @@ class FrameExtractor:
             media_id=media_id,
             timestamp_quality=timestamp_quality,
             offset_quality=offset_quality,
+            media_revision=media_revision,
+            source_fingerprint=source_fingerprint,
         )
 
     async def _extract_image(
@@ -142,14 +160,43 @@ class FrameExtractor:
         media_id: str | None = None,
         timestamp_quality: str = "unknown",
         offset_quality: str = "exact",
+        media_revision: int = 1,
+        source_fingerprint: str | None = None,
     ) -> list[ExtractedFrame]:
-        """Read and validate image file bytes."""
+        """Read and validate image file bytes with optional cache reuse."""
+        cache_key = None
+        if self._cache and source_fingerprint:
+            cache_key = self._cache.make_key(source_fingerprint, media_revision, 0.0)
+            cached = await self._cache.get(cache_key)
+            if cached is not None:
+                return [
+                    ExtractedFrame(
+                        data=cached.data,
+                        mime_type=cached.mime_type,
+                        media_id=media_id,
+                        offset_seconds=0.0,
+                        timestamp_quality=timestamp_quality,
+                        offset_quality=offset_quality,
+                    )
+                ]
+
         try:
             raw_bytes = await asyncio.to_thread(media_path.read_bytes)
         except OSError as err:
             raise FrameExtractionError("MEDIA_UNAVAILABLE", f"Cannot read media file: {err}") from err
 
         detected_mime = await asyncio.to_thread(validate_image_bytes, raw_bytes)
+
+        if self._cache and cache_key:
+            await self._cache.put(
+                key=cache_key,
+                frame_data=raw_bytes,
+                mime_type=detected_mime,
+                canonical_seek=0.0,
+                source_fingerprint=source_fingerprint,
+                media_revision=media_revision,
+            )
+
         return [
             ExtractedFrame(
                 data=raw_bytes,
@@ -171,8 +218,10 @@ class FrameExtractor:
         media_id: str | None = None,
         timestamp_quality: str = "unknown",
         offset_quality: str = "exact",
+        media_revision: int = 1,
+        source_fingerprint: str | None = None,
     ) -> list[ExtractedFrame]:
-        """Extract chronological frames from a video file using ffmpeg."""
+        """Extract chronological frames from a video file using ffmpeg with cache and stampede guard."""
         ffmpeg_exec = await asyncio.to_thread(self._resolve_ffmpeg)
         if not ffmpeg_exec:
             raise FrameExtractionError("FFMPEG_NOT_FOUND", "ffmpeg binary not found; failing closed")
@@ -185,9 +234,28 @@ class FrameExtractor:
         frames: list[ExtractedFrame] = []
 
         for ts in ts_list:
-            frame_data = await self._run_ffmpeg_extract_frame(
-                ffmpeg_exec, media_path, ts, timeout_seconds=timeout_seconds
-            )
+            if self._cache and source_fingerprint:
+                cache_key = self._cache.make_key(source_fingerprint, media_revision, ts)
+
+                async def _extract_fn(t_seek: float = ts) -> bytes | None:
+                    assert ffmpeg_exec is not None
+                    return await self._run_ffmpeg_extract_frame(
+                        ffmpeg_exec, media_path, t_seek, timeout_seconds=timeout_seconds
+                    )
+
+                frame_data = await self._cache.get_or_extract(
+                    key=cache_key,
+                    extract_fn=_extract_fn,
+                    mime_type="image/jpeg",
+                    canonical_seek=ts,
+                    source_fingerprint=source_fingerprint,
+                    media_revision=media_revision,
+                )
+            else:
+                frame_data = await self._run_ffmpeg_extract_frame(
+                    ffmpeg_exec, media_path, ts, timeout_seconds=timeout_seconds
+                )
+
             if frame_data:
                 frames.append(
                     ExtractedFrame(

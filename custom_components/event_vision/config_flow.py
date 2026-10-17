@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 try:
@@ -18,6 +17,8 @@ from .const import (
     CONF_CONCURRENCY,
     CONF_ENABLE_FUSION,
     CONF_EXTRACTION_TIMEOUT,
+    CONF_FRAME_CACHE_MB,
+    CONF_FRAME_CACHE_TTL,
     CONF_FUSION_JOB_DEADLINE,
     CONF_FUSION_MAX_FRAMES,
     CONF_FUSION_PROMPT_INSTRUCTIONS,
@@ -33,6 +34,8 @@ from .const import (
     DEFAULT_CONCURRENCY,
     DEFAULT_ENABLE_FUSION,
     DEFAULT_EXTRACTION_TIMEOUT,
+    DEFAULT_FRAME_CACHE_MB,
+    DEFAULT_FRAME_CACHE_TTL,
     DEFAULT_FUSION_JOB_DEADLINE,
     DEFAULT_FUSION_MAX_FRAMES,
     DEFAULT_FUSION_PROMPT,
@@ -49,6 +52,8 @@ from .const import (
     MAX_ATTEMPTS_BOUND,
     MAX_CONCURRENCY,
     MAX_EXTRACTION_TIMEOUT,
+    MAX_FRAME_CACHE_MB,
+    MAX_FRAME_CACHE_TTL,
     MAX_FRAMES_BUDGET,
     MAX_FUSION_JOB_DEADLINE,
     MAX_FUSION_MAX_FRAMES,
@@ -59,6 +64,8 @@ from .const import (
     MIN_ATTEMPTS,
     MIN_CONCURRENCY,
     MIN_EXTRACTION_TIMEOUT,
+    MIN_FRAME_CACHE_MB,
+    MIN_FRAME_CACHE_TTL,
     MIN_FRAMES,
     MIN_FUSION_JOB_DEADLINE,
     MIN_FUSION_MAX_FRAMES,
@@ -68,7 +75,23 @@ from .const import (
     SAMPLING_POLICY_TRIGGER_RELEVANT,
     VALID_SAMPLING_POLICIES,
 )
-from .core.models import model_alias_info, validate_budget_bounds, validate_fusion_budget_bounds
+from .core.models import (
+    SPEC_CONCURRENCY,
+    SPEC_EXTRACTION_TIMEOUT,
+    SPEC_FRAME_CACHE_MB,
+    SPEC_FRAME_CACHE_TTL,
+    SPEC_FUSION_JOB_DEADLINE,
+    SPEC_FUSION_MAX_FRAMES,
+    SPEC_JOB_DEADLINE,
+    SPEC_MAX_ATTEMPTS,
+    SPEC_MAX_FRAMES,
+    SPEC_PROVIDER_TIMEOUT,
+    ValidationError,
+    model_alias_info,
+    validate_budget_bounds,
+    validate_fusion_budget_bounds,
+)
+from .validation import number_spec_selector
 
 
 class EventVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -91,18 +114,13 @@ class EventVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not api_key:
                 errors[CONF_GEMINI_API_KEY] = "invalid_api_key"
 
-            concurrency_raw = user_input.get(CONF_CONCURRENCY, DEFAULT_CONCURRENCY)
-            if (
-                isinstance(concurrency_raw, bool)
-                or not isinstance(concurrency_raw, (int, float))
-                or not math.isfinite(concurrency_raw)
-                or (isinstance(concurrency_raw, float) and not concurrency_raw.is_integer())
-            ):
+            try:
+                concurrency = int(
+                    SPEC_CONCURRENCY.validate(user_input.get(CONF_CONCURRENCY, DEFAULT_CONCURRENCY))
+                )
+            except (ValidationError, ValueError, TypeError):
                 errors[CONF_CONCURRENCY] = "invalid_concurrency"
-            else:
-                concurrency = int(concurrency_raw)
-                if not (MIN_CONCURRENCY <= concurrency <= MAX_CONCURRENCY):
-                    errors[CONF_CONCURRENCY] = "invalid_concurrency"
+                concurrency = DEFAULT_CONCURRENCY
 
             model = str(user_input.get(CONF_MODEL, DEFAULT_MODEL)).strip() or DEFAULT_MODEL
 
@@ -112,7 +130,7 @@ class EventVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     data={
                         CONF_GEMINI_API_KEY: api_key,
                         CONF_MODEL: model,
-                        CONF_CONCURRENCY: int(concurrency_raw),
+                        CONF_CONCURRENCY: concurrency,
                         CONF_AUTO_ANALYZE: bool(user_input.get(CONF_AUTO_ANALYZE, DEFAULT_AUTO_ANALYZE)),
                         # Sensible default values for sampling and coupled advanced parameters
                         CONF_PROMPT_INSTRUCTIONS: DEFAULT_PROMPT_INSTRUCTIONS,
@@ -138,12 +156,16 @@ class EventVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Optional(CONF_MODEL, default=DEFAULT_MODEL): selector.TextSelector(
                     selector.TextSelectorConfig(type=selector.TextSelectorType.TEXT)
                 ),
-                vol.Optional(CONF_CONCURRENCY, default=DEFAULT_CONCURRENCY): selector.NumberSelector(
-                    selector.NumberSelectorConfig(
-                        min=MIN_CONCURRENCY,
-                        max=MAX_CONCURRENCY,
-                        step=1,
-                        mode=selector.NumberSelectorMode.BOX,
+                vol.Optional(CONF_CONCURRENCY, default=DEFAULT_CONCURRENCY): (
+                    number_spec_selector(SPEC_CONCURRENCY)
+                    if number_spec_selector is not None
+                    else selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=MIN_CONCURRENCY,
+                            max=MAX_CONCURRENCY,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
                     )
                 ),
                 vol.Optional(CONF_AUTO_ANALYZE, default=DEFAULT_AUTO_ANALYZE): selector.BooleanSelector(),
@@ -197,24 +219,18 @@ class EventVisionOptionsFlow(config_entries.OptionsFlow):
                 errors[CONF_MODEL] = "invalid_model"
 
             concurrency_raw = user_input.get(CONF_CONCURRENCY, current_data.get(CONF_CONCURRENCY, DEFAULT_CONCURRENCY))
-            if (
-                isinstance(concurrency_raw, bool)
-                or not isinstance(concurrency_raw, (int, float))
-                or not math.isfinite(concurrency_raw)
-                or (isinstance(concurrency_raw, float) and not concurrency_raw.is_integer())
-            ):
+            try:
+                concurrency = int(SPEC_CONCURRENCY.validate(concurrency_raw))
+            except (ValidationError, ValueError, TypeError):
                 errors[CONF_CONCURRENCY] = "invalid_concurrency"
-            else:
-                concurrency = int(concurrency_raw)
-                if not (MIN_CONCURRENCY <= concurrency <= MAX_CONCURRENCY):
-                    errors[CONF_CONCURRENCY] = "invalid_concurrency"
+                concurrency = current_data.get(CONF_CONCURRENCY, DEFAULT_CONCURRENCY)
 
             if not errors:
                 updated_options = {
                     **current_data,
                     CONF_GEMINI_API_KEY: api_key,
                     CONF_MODEL: model,
-                    CONF_CONCURRENCY: int(concurrency_raw),
+                    CONF_CONCURRENCY: concurrency,
                     CONF_AUTO_ANALYZE: bool(user_input.get(CONF_AUTO_ANALYZE, current_data.get(CONF_AUTO_ANALYZE, DEFAULT_AUTO_ANALYZE))),
                 }
                 return self.async_create_entry(title="", data=updated_options)
@@ -230,12 +246,16 @@ class EventVisionOptionsFlow(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_CONCURRENCY,
                     default=current_data.get(CONF_CONCURRENCY, DEFAULT_CONCURRENCY),
-                ): selector.NumberSelector(
-                    selector.NumberSelectorConfig(
-                        min=MIN_CONCURRENCY,
-                        max=MAX_CONCURRENCY,
-                        step=1,
-                        mode=selector.NumberSelectorMode.BOX,
+                ): (
+                    number_spec_selector(SPEC_CONCURRENCY)
+                    if number_spec_selector is not None
+                    else selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=MIN_CONCURRENCY,
+                            max=MAX_CONCURRENCY,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
                     )
                 ),
                 vol.Optional(
@@ -256,18 +276,11 @@ class EventVisionOptionsFlow(config_entries.OptionsFlow):
 
         if user_input is not None:
             max_frames_raw = user_input.get(CONF_MAX_FRAMES, current_data.get(CONF_MAX_FRAMES, DEFAULT_MAX_FRAMES))
-            if (
-                isinstance(max_frames_raw, bool)
-                or not isinstance(max_frames_raw, (int, float))
-                or not math.isfinite(max_frames_raw)
-                or (isinstance(max_frames_raw, float) and not max_frames_raw.is_integer())
-            ):
+            try:
+                max_frames = int(SPEC_MAX_FRAMES.validate(max_frames_raw))
+            except (ValidationError, ValueError, TypeError):
                 errors[CONF_MAX_FRAMES] = "invalid_max_frames"
-                max_frames = DEFAULT_MAX_FRAMES
-            else:
-                max_frames = int(max_frames_raw)
-                if not (MIN_FRAMES <= max_frames <= MAX_FRAMES_BUDGET):
-                    errors[CONF_MAX_FRAMES] = "invalid_max_frames"
+                max_frames = current_data.get(CONF_MAX_FRAMES, DEFAULT_MAX_FRAMES)
 
             policy = str(user_input.get(CONF_SAMPLING_POLICY, current_data.get(CONF_SAMPLING_POLICY, DEFAULT_SAMPLING_POLICY))).strip()
             if policy not in VALID_SAMPLING_POLICIES:
@@ -302,12 +315,16 @@ class EventVisionOptionsFlow(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_MAX_FRAMES,
                     default=current_data.get(CONF_MAX_FRAMES, DEFAULT_MAX_FRAMES),
-                ): selector.NumberSelector(
-                    selector.NumberSelectorConfig(
-                        min=MIN_FRAMES,
-                        max=MAX_FRAMES_BUDGET,
-                        step=1,
-                        mode=selector.NumberSelectorMode.BOX,
+                ): (
+                    number_spec_selector(SPEC_MAX_FRAMES)
+                    if number_spec_selector is not None
+                    else selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=MIN_FRAMES,
+                            max=MAX_FRAMES_BUDGET,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
                     )
                 ),
                 vol.Optional(
@@ -351,17 +368,11 @@ class EventVisionOptionsFlow(config_entries.OptionsFlow):
                 CONF_FUSION_MAX_FRAMES,
                 current_data.get(CONF_FUSION_MAX_FRAMES, DEFAULT_FUSION_MAX_FRAMES),
             )
-            if (
-                isinstance(raw_max_frames, bool)
-                or not isinstance(raw_max_frames, (int, float))
-                or not math.isfinite(raw_max_frames)
-                or (isinstance(raw_max_frames, float) and not raw_max_frames.is_integer())
-                or not (MIN_FUSION_MAX_FRAMES <= int(raw_max_frames) <= MAX_FUSION_MAX_FRAMES)
-            ):
+            try:
+                fusion_max_frames = int(SPEC_FUSION_MAX_FRAMES.validate(raw_max_frames))
+            except (ValidationError, ValueError, TypeError):
                 errors[CONF_FUSION_MAX_FRAMES] = "invalid_fusion_max_frames"
-                fusion_max_frames = DEFAULT_FUSION_MAX_FRAMES
-            else:
-                fusion_max_frames = int(raw_max_frames)
+                fusion_max_frames = current_data.get(CONF_FUSION_MAX_FRAMES, DEFAULT_FUSION_MAX_FRAMES)
 
             instructions = str(user_input.get(CONF_FUSION_PROMPT_INSTRUCTIONS, "")).strip()
             if len(instructions) > MAX_FUSION_PROMPT_INSTRUCTIONS_LEN:
@@ -371,16 +382,11 @@ class EventVisionOptionsFlow(config_entries.OptionsFlow):
                 CONF_FUSION_JOB_DEADLINE,
                 current_data.get(CONF_FUSION_JOB_DEADLINE, DEFAULT_FUSION_JOB_DEADLINE),
             )
-            if (
-                isinstance(raw_deadline, bool)
-                or not isinstance(raw_deadline, (int, float))
-                or not math.isfinite(raw_deadline)
-                or not (MIN_FUSION_JOB_DEADLINE <= float(raw_deadline) <= MAX_FUSION_JOB_DEADLINE)
-            ):
+            try:
+                fusion_deadline = float(SPEC_FUSION_JOB_DEADLINE.validate(raw_deadline))
+            except (ValidationError, ValueError, TypeError):
                 errors[CONF_FUSION_JOB_DEADLINE] = "invalid_fusion_deadline"
-                fusion_deadline = DEFAULT_FUSION_JOB_DEADLINE
-            else:
-                fusion_deadline = float(raw_deadline)
+                fusion_deadline = current_data.get(CONF_FUSION_JOB_DEADLINE, DEFAULT_FUSION_JOB_DEADLINE)
 
             if not errors:
                 valid_fbudget, _ = validate_fusion_budget_bounds(
@@ -411,12 +417,16 @@ class EventVisionOptionsFlow(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_FUSION_MAX_FRAMES,
                     default=current_data.get(CONF_FUSION_MAX_FRAMES, DEFAULT_FUSION_MAX_FRAMES),
-                ): selector.NumberSelector(
-                    selector.NumberSelectorConfig(
-                        min=MIN_FUSION_MAX_FRAMES,
-                        max=MAX_FUSION_MAX_FRAMES,
-                        step=1,
-                        mode=selector.NumberSelectorMode.BOX,
+                ): (
+                    number_spec_selector(SPEC_FUSION_MAX_FRAMES)
+                    if number_spec_selector is not None
+                    else selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=MIN_FUSION_MAX_FRAMES,
+                            max=MAX_FUSION_MAX_FRAMES,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
                     )
                 ),
                 vol.Optional(
@@ -428,13 +438,17 @@ class EventVisionOptionsFlow(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_FUSION_JOB_DEADLINE,
                     default=current_data.get(CONF_FUSION_JOB_DEADLINE, DEFAULT_FUSION_JOB_DEADLINE),
-                ): selector.NumberSelector(
-                    selector.NumberSelectorConfig(
-                        min=MIN_FUSION_JOB_DEADLINE,
-                        max=MAX_FUSION_JOB_DEADLINE,
-                        step=10,
-                        unit_of_measurement="s",
-                        mode=selector.NumberSelectorMode.BOX,
+                ): (
+                    number_spec_selector(SPEC_FUSION_JOB_DEADLINE, step=10, unit_of_measurement="s")
+                    if number_spec_selector is not None
+                    else selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=MIN_FUSION_JOB_DEADLINE,
+                            max=MAX_FUSION_JOB_DEADLINE,
+                            step=10,
+                            unit_of_measurement="s",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
                     )
                 ),
             }
@@ -454,50 +468,55 @@ class EventVisionOptionsFlow(config_entries.OptionsFlow):
             raw_provider = user_input.get(CONF_PROVIDER_TIMEOUT, current_data.get(CONF_PROVIDER_TIMEOUT, DEFAULT_PROVIDER_TIMEOUT))
             raw_extraction = user_input.get(CONF_EXTRACTION_TIMEOUT, current_data.get(CONF_EXTRACTION_TIMEOUT, DEFAULT_EXTRACTION_TIMEOUT))
             raw_attempts = user_input.get(CONF_MAX_ATTEMPTS, current_data.get(CONF_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS))
+            raw_cache_mb = user_input.get(CONF_FRAME_CACHE_MB, current_data.get(CONF_FRAME_CACHE_MB, DEFAULT_FRAME_CACHE_MB))
+            raw_cache_ttl = user_input.get(CONF_FRAME_CACHE_TTL, current_data.get(CONF_FRAME_CACHE_TTL, DEFAULT_FRAME_CACHE_TTL))
             current_max_frames = current_data.get(CONF_MAX_FRAMES, DEFAULT_MAX_FRAMES)
 
-            # Validate raw inputs before coercion
-            if (
-                isinstance(raw_deadline, bool)
-                or not isinstance(raw_deadline, (int, float))
-                or not math.isfinite(raw_deadline)
-                or not (MIN_JOB_DEADLINE <= float(raw_deadline) <= MAX_JOB_DEADLINE)
-            ):
+            deadline = current_data.get(CONF_JOB_DEADLINE, DEFAULT_JOB_DEADLINE)
+            provider_timeout = current_data.get(CONF_PROVIDER_TIMEOUT, DEFAULT_PROVIDER_TIMEOUT)
+            extraction_timeout = current_data.get(CONF_EXTRACTION_TIMEOUT, DEFAULT_EXTRACTION_TIMEOUT)
+            attempts = current_data.get(CONF_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS)
+            cache_mb = current_data.get(CONF_FRAME_CACHE_MB, DEFAULT_FRAME_CACHE_MB)
+            cache_ttl = current_data.get(CONF_FRAME_CACHE_TTL, DEFAULT_FRAME_CACHE_TTL)
+
+            try:
+                deadline = float(SPEC_JOB_DEADLINE.validate(raw_deadline))
+            except (ValidationError, ValueError, TypeError):
                 errors[CONF_JOB_DEADLINE] = "invalid_job_deadline"
 
-            if (
-                isinstance(raw_provider, bool)
-                or not isinstance(raw_provider, (int, float))
-                or not math.isfinite(raw_provider)
-                or not (MIN_PROVIDER_TIMEOUT <= float(raw_provider) <= MAX_PROVIDER_TIMEOUT)
-            ):
+            try:
+                provider_timeout = float(SPEC_PROVIDER_TIMEOUT.validate(raw_provider))
+            except (ValidationError, ValueError, TypeError):
                 errors[CONF_PROVIDER_TIMEOUT] = "invalid_provider_timeout"
 
-            if (
-                isinstance(raw_extraction, bool)
-                or not isinstance(raw_extraction, (int, float))
-                or not math.isfinite(raw_extraction)
-                or not (MIN_EXTRACTION_TIMEOUT <= float(raw_extraction) <= MAX_EXTRACTION_TIMEOUT)
-            ):
+            try:
+                extraction_timeout = float(SPEC_EXTRACTION_TIMEOUT.validate(raw_extraction))
+            except (ValidationError, ValueError, TypeError):
                 errors[CONF_EXTRACTION_TIMEOUT] = "invalid_extraction_timeout"
 
-            if (
-                isinstance(raw_attempts, bool)
-                or not isinstance(raw_attempts, (int, float))
-                or not math.isfinite(raw_attempts)
-                or (isinstance(raw_attempts, float) and not raw_attempts.is_integer())
-                or not (MIN_ATTEMPTS <= int(raw_attempts) <= MAX_ATTEMPTS_BOUND)
-            ):
+            try:
+                attempts = int(SPEC_MAX_ATTEMPTS.validate(raw_attempts))
+            except (ValidationError, ValueError, TypeError):
                 errors[CONF_MAX_ATTEMPTS] = "invalid_max_attempts"
+
+            try:
+                cache_mb = int(SPEC_FRAME_CACHE_MB.validate(raw_cache_mb))
+            except (ValidationError, ValueError, TypeError):
+                errors[CONF_FRAME_CACHE_MB] = "invalid_frame_cache_mb"
+
+            try:
+                cache_ttl = float(SPEC_FRAME_CACHE_TTL.validate(raw_cache_ttl))
+            except (ValidationError, ValueError, TypeError):
+                errors[CONF_FRAME_CACHE_TTL] = "invalid_frame_cache_ttl"
 
             # Check coupled budget only if individual bounds are valid
             if not errors:
                 valid_budget, _ = validate_budget_bounds(
-                    job_deadline=float(raw_deadline),
-                    provider_timeout=float(raw_provider),
-                    extraction_timeout=float(raw_extraction),
+                    job_deadline=deadline,
+                    provider_timeout=provider_timeout,
+                    extraction_timeout=extraction_timeout,
                     max_frames=int(current_max_frames),
-                    max_attempts=int(raw_attempts),
+                    max_attempts=int(attempts),
                 )
                 if not valid_budget:
                     errors[CONF_JOB_DEADLINE] = "budget_deadline_too_short"
@@ -506,8 +525,8 @@ class EventVisionOptionsFlow(config_entries.OptionsFlow):
                     valid_fbudget, _ = validate_fusion_budget_bounds(
                         fusion_job_deadline=current_data.get(CONF_FUSION_JOB_DEADLINE, DEFAULT_FUSION_JOB_DEADLINE),
                         fusion_max_frames=current_data.get(CONF_FUSION_MAX_FRAMES, DEFAULT_FUSION_MAX_FRAMES),
-                        provider_timeout=float(raw_provider),
-                        extraction_timeout=float(raw_extraction),
+                        provider_timeout=provider_timeout,
+                        extraction_timeout=extraction_timeout,
                     )
                     if not valid_fbudget:
                         errors[CONF_JOB_DEADLINE] = "budget_deadline_too_short"
@@ -515,10 +534,12 @@ class EventVisionOptionsFlow(config_entries.OptionsFlow):
             if not errors:
                 updated_options = {
                     **current_data,
-                    CONF_JOB_DEADLINE: float(raw_deadline),
-                    CONF_PROVIDER_TIMEOUT: float(raw_provider),
-                    CONF_EXTRACTION_TIMEOUT: float(raw_extraction),
-                    CONF_MAX_ATTEMPTS: int(raw_attempts),
+                    CONF_JOB_DEADLINE: deadline,
+                    CONF_PROVIDER_TIMEOUT: provider_timeout,
+                    CONF_EXTRACTION_TIMEOUT: extraction_timeout,
+                    CONF_MAX_ATTEMPTS: attempts,
+                    CONF_FRAME_CACHE_MB: cache_mb,
+                    CONF_FRAME_CACHE_TTL: cache_ttl,
                 }
                 return self.async_create_entry(title="", data=updated_options)
 
@@ -527,48 +548,96 @@ class EventVisionOptionsFlow(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_JOB_DEADLINE,
                     default=current_data.get(CONF_JOB_DEADLINE, DEFAULT_JOB_DEADLINE),
-                ): selector.NumberSelector(
-                    selector.NumberSelectorConfig(
-                        min=MIN_JOB_DEADLINE,
-                        max=MAX_JOB_DEADLINE,
-                        step=5,
-                        unit_of_measurement="s",
-                        mode=selector.NumberSelectorMode.BOX,
+                ): (
+                    number_spec_selector(SPEC_JOB_DEADLINE, step=5, unit_of_measurement="s")
+                    if number_spec_selector is not None
+                    else selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=MIN_JOB_DEADLINE,
+                            max=MAX_JOB_DEADLINE,
+                            step=5,
+                            unit_of_measurement="s",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
                     )
                 ),
                 vol.Optional(
                     CONF_PROVIDER_TIMEOUT,
                     default=current_data.get(CONF_PROVIDER_TIMEOUT, DEFAULT_PROVIDER_TIMEOUT),
-                ): selector.NumberSelector(
-                    selector.NumberSelectorConfig(
-                        min=MIN_PROVIDER_TIMEOUT,
-                        max=MAX_PROVIDER_TIMEOUT,
-                        step=5,
-                        unit_of_measurement="s",
-                        mode=selector.NumberSelectorMode.BOX,
+                ): (
+                    number_spec_selector(SPEC_PROVIDER_TIMEOUT, step=5, unit_of_measurement="s")
+                    if number_spec_selector is not None
+                    else selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=MIN_PROVIDER_TIMEOUT,
+                            max=MAX_PROVIDER_TIMEOUT,
+                            step=5,
+                            unit_of_measurement="s",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
                     )
                 ),
                 vol.Optional(
                     CONF_EXTRACTION_TIMEOUT,
                     default=current_data.get(CONF_EXTRACTION_TIMEOUT, DEFAULT_EXTRACTION_TIMEOUT),
-                ): selector.NumberSelector(
-                    selector.NumberSelectorConfig(
-                        min=MIN_EXTRACTION_TIMEOUT,
-                        max=MAX_EXTRACTION_TIMEOUT,
-                        step=1,
-                        unit_of_measurement="s",
-                        mode=selector.NumberSelectorMode.BOX,
+                ): (
+                    number_spec_selector(SPEC_EXTRACTION_TIMEOUT, step=1, unit_of_measurement="s")
+                    if number_spec_selector is not None
+                    else selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=MIN_EXTRACTION_TIMEOUT,
+                            max=MAX_EXTRACTION_TIMEOUT,
+                            step=1,
+                            unit_of_measurement="s",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
                     )
                 ),
                 vol.Optional(
                     CONF_MAX_ATTEMPTS,
                     default=current_data.get(CONF_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS),
-                ): selector.NumberSelector(
-                    selector.NumberSelectorConfig(
-                        min=MIN_ATTEMPTS,
-                        max=MAX_ATTEMPTS_BOUND,
-                        step=1,
-                        mode=selector.NumberSelectorMode.BOX,
+                ): (
+                    number_spec_selector(SPEC_MAX_ATTEMPTS)
+                    if number_spec_selector is not None
+                    else selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=MIN_ATTEMPTS,
+                            max=MAX_ATTEMPTS_BOUND,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    )
+                ),
+                vol.Optional(
+                    CONF_FRAME_CACHE_MB,
+                    default=current_data.get(CONF_FRAME_CACHE_MB, DEFAULT_FRAME_CACHE_MB),
+                ): (
+                    number_spec_selector(SPEC_FRAME_CACHE_MB, step=8, unit_of_measurement="MB")
+                    if number_spec_selector is not None
+                    else selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=MIN_FRAME_CACHE_MB,
+                            max=MAX_FRAME_CACHE_MB,
+                            step=8,
+                            unit_of_measurement="MB",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    )
+                ),
+                vol.Optional(
+                    CONF_FRAME_CACHE_TTL,
+                    default=current_data.get(CONF_FRAME_CACHE_TTL, DEFAULT_FRAME_CACHE_TTL),
+                ): (
+                    number_spec_selector(SPEC_FRAME_CACHE_TTL, step=30, unit_of_measurement="s")
+                    if number_spec_selector is not None
+                    else selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=MIN_FRAME_CACHE_TTL,
+                            max=MAX_FRAME_CACHE_TTL,
+                            step=30,
+                            unit_of_measurement="s",
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
                     )
                 ),
             }
