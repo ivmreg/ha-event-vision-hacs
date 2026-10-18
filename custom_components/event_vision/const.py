@@ -23,12 +23,14 @@ CONF_JOB_DEADLINE = "job_deadline"
 CONF_PROVIDER_TIMEOUT = "provider_timeout"
 CONF_EXTRACTION_TIMEOUT = "extraction_timeout"
 CONF_MAX_ATTEMPTS = "max_attempts"
+CONF_ENABLE_DEBUG_LOGGING = "enable_debug_logging"
 
 # Default configuration values
 DEFAULT_MODEL = "gemini-flash-lite-latest"
 DEFAULT_CONCURRENCY = 1
 DEFAULT_AUTO_ANALYZE = True
 DEFAULT_PROMPT_INSTRUCTIONS = ""
+DEFAULT_ENABLE_DEBUG_LOGGING = False
 
 # Sampling policies & budget
 DEFAULT_MAX_FRAMES = 6
@@ -148,3 +150,8 @@ MAX_FRAME_CACHE_TTL = 86400.0
 # Service names
 SERVICE_ANALYZE = "analyze"
 SERVICE_ANALYZE_INCIDENT = "analyze_incident"
+
+# Diagnostic Logging
+CONF_ENABLE_DEBUG_LOGGING = "enable_debug_logging"
+DEFAULT_ENABLE_DEBUG_LOGGING = False
+

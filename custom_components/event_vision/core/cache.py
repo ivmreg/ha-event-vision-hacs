@@ -133,6 +133,7 @@ class FrameCache:
             frame = self._entries.get(key)
             if frame is None:
                 self._misses += 1
+                _LOGGER.debug("FrameCache miss for key: %s", key)
                 return None
 
             now = time.monotonic()
@@ -142,11 +143,18 @@ class FrameCache:
                 self._current_bytes -= frame.size_bytes
                 self._evictions += 1
                 self._misses += 1
+                _LOGGER.debug(
+                    "FrameCache TTL expired for key: %s (age=%.1fs, size=%d bytes)",
+                    key,
+                    now - frame.created_at,
+                    frame.size_bytes,
+                )
                 return None
 
             # LRU hit: move to end
             self._entries.move_to_end(key)
             self._hits += 1
+            _LOGGER.debug("FrameCache hit for key: %s (size=%d bytes)", key, frame.size_bytes)
             return frame
 
     def _put_locked(
@@ -173,6 +181,12 @@ class FrameCache:
             _, oldest = self._entries.popitem(last=False)
             self._current_bytes -= oldest.size_bytes
             self._evictions += 1
+            _LOGGER.debug(
+                "FrameCache LRU eviction (freed=%d bytes, remaining=%d/%d bytes)",
+                oldest.size_bytes,
+                self._current_bytes,
+                self._max_bytes,
+            )
 
         now = time.monotonic()
         entry = CachedFrame(
@@ -187,6 +201,13 @@ class FrameCache:
         )
         self._entries[key] = entry
         self._current_bytes += size
+        _LOGGER.debug(
+            "FrameCache stored entry for key: %s (size=%d bytes, cache_total=%d/%d bytes)",
+            key,
+            size,
+            self._current_bytes,
+            self._max_bytes,
+        )
         return True
 
     async def put(
@@ -259,11 +280,13 @@ class FrameCache:
 
             if key in self._in_flight:
                 future = self._in_flight[key]
+                _LOGGER.debug("FrameCache coalescing concurrent extraction for key: %s (in-flight waiter)", key)
             else:
                 loop = asyncio.get_running_loop()
                 future = loop.create_future()
                 self._in_flight[key] = future
                 leader = True
+                _LOGGER.debug("FrameCache leader initiating extraction for key: %s", key)
 
         if not leader:
             # Waiter: await the leader's extraction result shielded from cancellation
@@ -380,6 +403,8 @@ class FrameCache:
     async def clear(self) -> None:
         """Clear all entries, advance epoch, and cancel any in-flight requests."""
         async with self._lock:
+            freed = self._current_bytes
+            count = len(self._entries)
             self._epoch += 1
             self._entries.clear()
             self._current_bytes = 0
@@ -387,6 +412,7 @@ class FrameCache:
                 if not fut.done():
                     fut.cancel()
             self._in_flight.clear()
+            _LOGGER.debug("FrameCache cleared: %d entries freed (%d bytes)", count, freed)
 
     async def close(self) -> None:
         """Close cache and mark as closed."""

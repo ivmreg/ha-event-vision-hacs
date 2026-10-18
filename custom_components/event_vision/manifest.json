@@ -8,5 +8,5 @@
   "issue_tracker": "https://github.com/ivmreg/ha-event-vision/issues",
   "dependencies": ["event_recording"],
   "requirements": ["Pillow==12.3.0"],
-  "version": "0.4.1"
+  "version": "0.4.2"
 }

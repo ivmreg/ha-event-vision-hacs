@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import re
+import time
 import urllib.parse
 from datetime import UTC
 from typing import Any
@@ -79,7 +80,9 @@ def parse_retry_after(
             return None
         if delay < 0.0:
             return 0.0
-        return min(delay, effective_max)
+        parsed = min(delay, effective_max)
+        _LOGGER.debug("Parsed numeric Retry-After delay: %.2fs (capped to %.2fs)", delay, parsed)
+        return parsed
     except (ValueError, OverflowError):
         pass
 
@@ -95,7 +98,9 @@ def parse_retry_after(
                 return None
             if diff < 0.0:
                 return 0.0
-            return min(diff, effective_max)
+            parsed = min(diff, effective_max)
+            _LOGGER.debug("Parsed HTTP-date Retry-After delay: %.2fs (capped to %.2fs)", diff, parsed)
+            return parsed
     except Exception:
         pass
 
@@ -244,6 +249,15 @@ class GeminiClient:
             "x-goog-api-key": self._api_key,
         }
 
+        effective_model = model or self._model
+        _LOGGER.debug(
+            "Dispatching Gemini generateContent request: model=%s, frame_count=%d, prompt_chars=%d, timeout=%.1fs",
+            effective_model,
+            len(frames),
+            len(prompt_text),
+            timeout_seconds,
+        )
+        start_time = time.monotonic()
         try:
             async with session.post(
                 url,
@@ -251,13 +265,28 @@ class GeminiClient:
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=timeout_seconds),
             ) as resp:
+                latency = time.monotonic() - start_time
                 status = resp.status
                 if status == 200:
                     raw_json = await resp.json()
+                    usage = raw_json.get("usageMetadata", {}) if isinstance(raw_json, dict) else {}
+                    _LOGGER.debug(
+                        "Gemini response 200 in %.2fs: prompt_tokens=%s, candidates_tokens=%s, total_tokens=%s",
+                        latency,
+                        usage.get("promptTokenCount"),
+                        usage.get("candidatesTokenCount"),
+                        usage.get("totalTokenCount"),
+                    )
                     return self._parse_and_validate_response(raw_json)
 
                 retry_after_raw = resp.headers.get("Retry-After")
                 retry_delay = parse_retry_after(retry_after_raw)
+                _LOGGER.debug(
+                    "Gemini error response status=%d in %.2fs (retry_delay=%s)",
+                    status,
+                    latency,
+                    retry_delay,
+                )
 
                 if status == 429:
                     raise AnalysisError(
@@ -490,6 +519,15 @@ class GeminiClient:
             "x-goog-api-key": self._api_key,
         }
 
+        effective_model = model or self._model
+        _LOGGER.debug(
+            "Dispatching Gemini fusion generateContent request: model=%s, view_count=%d, frame_count=%d, timeout=%.1fs",
+            effective_model,
+            len(views),
+            total_frames,
+            timeout_seconds,
+        )
+        start_time = time.monotonic()
         try:
             async with session.post(
                 url,
@@ -497,13 +535,28 @@ class GeminiClient:
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=timeout_seconds),
             ) as resp:
+                latency = time.monotonic() - start_time
                 status = resp.status
                 if status == 200:
                     raw_json = await resp.json()
+                    usage = raw_json.get("usageMetadata", {}) if isinstance(raw_json, dict) else {}
+                    _LOGGER.debug(
+                        "Gemini fusion response 200 in %.2fs: prompt_tokens=%s, candidates_tokens=%s, total_tokens=%s",
+                        latency,
+                        usage.get("promptTokenCount"),
+                        usage.get("candidatesTokenCount"),
+                        usage.get("totalTokenCount"),
+                    )
                     return self._parse_and_validate_fusion_response(raw_json, valid_refs=valid_refs)
 
                 retry_after_raw = resp.headers.get("Retry-After")
                 retry_delay = parse_retry_after(retry_after_raw)
+                _LOGGER.debug(
+                    "Gemini fusion error response status=%d in %.2fs (retry_delay=%s)",
+                    status,
+                    latency,
+                    retry_delay,
+                )
 
                 if status == 429:
                     raise AnalysisError(

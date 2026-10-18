@@ -15,6 +15,7 @@ from homeassistant.helpers import selector
 from .const import (
     CONF_AUTO_ANALYZE,
     CONF_CONCURRENCY,
+    CONF_ENABLE_DEBUG_LOGGING,
     CONF_ENABLE_FUSION,
     CONF_EXTRACTION_TIMEOUT,
     CONF_FRAME_CACHE_MB,
@@ -32,6 +33,7 @@ from .const import (
     CONF_SAMPLING_POLICY,
     DEFAULT_AUTO_ANALYZE,
     DEFAULT_CONCURRENCY,
+    DEFAULT_ENABLE_DEBUG_LOGGING,
     DEFAULT_ENABLE_FUSION,
     DEFAULT_EXTRACTION_TIMEOUT,
     DEFAULT_FRAME_CACHE_MB,
@@ -145,6 +147,8 @@ class EventVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_FUSION_MAX_FRAMES: DEFAULT_FUSION_MAX_FRAMES,
                         CONF_FUSION_PROMPT_INSTRUCTIONS: DEFAULT_FUSION_PROMPT_INSTRUCTIONS,
                         CONF_FUSION_JOB_DEADLINE: DEFAULT_FUSION_JOB_DEADLINE,
+                        # Diagnostic logging
+                        CONF_ENABLE_DEBUG_LOGGING: DEFAULT_ENABLE_DEBUG_LOGGING,
                     },
                 )
 
@@ -232,6 +236,12 @@ class EventVisionOptionsFlow(config_entries.OptionsFlow):
                     CONF_MODEL: model,
                     CONF_CONCURRENCY: concurrency,
                     CONF_AUTO_ANALYZE: bool(user_input.get(CONF_AUTO_ANALYZE, current_data.get(CONF_AUTO_ANALYZE, DEFAULT_AUTO_ANALYZE))),
+                    CONF_ENABLE_DEBUG_LOGGING: bool(
+                        user_input.get(
+                            CONF_ENABLE_DEBUG_LOGGING,
+                            current_data.get(CONF_ENABLE_DEBUG_LOGGING, DEFAULT_ENABLE_DEBUG_LOGGING),
+                        )
+                    ),
                 }
                 return self.async_create_entry(title="", data=updated_options)
 
@@ -261,6 +271,12 @@ class EventVisionOptionsFlow(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_AUTO_ANALYZE,
                     default=current_data.get(CONF_AUTO_ANALYZE, DEFAULT_AUTO_ANALYZE),
+                ): selector.BooleanSelector(),
+                vol.Optional(
+                    CONF_ENABLE_DEBUG_LOGGING,
+                    default=current_data.get(
+                        CONF_ENABLE_DEBUG_LOGGING, DEFAULT_ENABLE_DEBUG_LOGGING
+                    ),
                 ): selector.BooleanSelector(),
             }
         )

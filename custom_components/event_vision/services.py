@@ -51,6 +51,14 @@ def async_register_services(hass: HomeAssistant) -> None:
         if not event_id:
             raise HomeAssistantError("event_id cannot be empty")
 
+        _LOGGER.debug(
+            "Service %s.%s called: event_id=%s, user_id=%s",
+            DOMAIN,
+            SERVICE_ANALYZE,
+            event_id,
+            call.context.user_id,
+        )
+
         domain_data = hass.data.get(DOMAIN, {})
         entries = domain_data.get("entries", {})
 
@@ -80,6 +88,14 @@ def async_register_services(hass: HomeAssistant) -> None:
         incident_id = call.data["incident_id"].strip()
         if not incident_id:
             raise HomeAssistantError("incident_id cannot be empty")
+
+        _LOGGER.debug(
+            "Service %s.%s called: incident_id=%s, user_id=%s",
+            DOMAIN,
+            SERVICE_ANALYZE_INCIDENT,
+            incident_id,
+            call.context.user_id,
+        )
 
         domain_data = hass.data.get(DOMAIN, {})
         entries = domain_data.get("entries", {})

@@ -128,6 +128,15 @@ class FrameExtractor:
         elif media_path.suffix.lower() in (".jpg", ".jpeg", ".png"):
             is_image = True
 
+        _LOGGER.debug(
+            "Starting frame extraction for %s: is_image=%s, max_frames=%d, duration=%s, timeout=%.1fs",
+            media_path.name,
+            is_image,
+            max_frames,
+            duration,
+            timeout_seconds,
+        )
+
         if is_image:
             if stat_res.st_size > MAX_IMAGE_SOURCE_BYTES:
                 raise FrameExtractionError("IMAGE_TOO_LARGE", "Image source exceeds byte limit")
@@ -310,6 +319,8 @@ class FrameExtractor:
             "pipe:1",
         ]
         proc = None
+        loop = asyncio.get_running_loop()
+        start_t = loop.time()
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -317,8 +328,21 @@ class FrameExtractor:
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+            elapsed = loop.time() - start_t
             if proc.returncode == 0 and stdout and stdout.startswith(JPEG_SOI):
+                _LOGGER.debug(
+                    "FFmpeg frame extraction succeeded at %.2fs (elapsed=%.2fs, bytes=%d)",
+                    timestamp,
+                    elapsed,
+                    len(stdout),
+                )
                 return stdout
+            _LOGGER.debug(
+                "FFmpeg frame extraction returned non-zero code %s at %.2fs (elapsed=%.2fs)",
+                proc.returncode,
+                timestamp,
+                elapsed,
+            )
         except asyncio.CancelledError:
             # Re-raise CancelledError; child process is reaped in finally
             raise

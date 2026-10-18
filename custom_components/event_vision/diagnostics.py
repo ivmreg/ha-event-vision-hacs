@@ -8,6 +8,7 @@ Strict privacy:
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from homeassistant.components.diagnostics import async_redact_data
@@ -15,6 +16,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    CONF_ENABLE_DEBUG_LOGGING,
     CONF_ENABLE_FUSION,
     CONF_EXTRACTION_TIMEOUT,
     CONF_FRAME_CACHE_MB,
@@ -30,6 +32,7 @@ from .const import (
     CONF_PROMPT_INSTRUCTIONS,
     CONF_PROVIDER_TIMEOUT,
     CONF_SAMPLING_POLICY,
+    DEFAULT_ENABLE_DEBUG_LOGGING,
     DEFAULT_ENABLE_FUSION,
     DEFAULT_EXTRACTION_TIMEOUT,
     DEFAULT_FRAME_CACHE_MB,
@@ -137,9 +140,18 @@ async def async_get_config_entry_diagnostics(
     profile_digest = coordinator.profile_digest if coordinator else None
     fusion_profile_digest = coordinator.fusion_profile_digest if coordinator else None
 
+    enable_debug = bool(current_data.get(CONF_ENABLE_DEBUG_LOGGING, DEFAULT_ENABLE_DEBUG_LOGGING))
+    effective_log_level = logging.getLevelName(
+        logging.getLogger("custom_components.event_vision").getEffectiveLevel()
+    )
+
     return {
         "entry_data": redacted_data,
         "entry_options": redacted_options,
+        "logging": {
+            CONF_ENABLE_DEBUG_LOGGING: enable_debug,
+            "effective_log_level": effective_log_level,
+        },
         "pre_payload_backup_exists": pre_payload_backup_exists,
         "queue_stats": queue_stats,
         "fusion_queue_stats": fusion_queue_stats,

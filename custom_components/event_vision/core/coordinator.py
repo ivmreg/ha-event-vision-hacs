@@ -317,6 +317,13 @@ class VisionCoordinator:
         if not self.rec_api.store.is_open:
             return
 
+        _LOGGER.debug(
+            "Received event notification for %s (rev=%s, auto_analyze=%s)",
+            event_id,
+            revision,
+            self.auto_analyze,
+        )
+
         if self.auto_analyze:
             async with self._get_event_lock(event_id):
                 event = await self.rec_api.get_event(event_id)
@@ -353,6 +360,12 @@ class VisionCoordinator:
                                 profile_payload=self.profile_payload,
                             )
                             if enqueued:
+                                _LOGGER.debug(
+                                    "Auto-enqueued analysis job for event %s (rev=%s, gen=%s)",
+                                    event_id,
+                                    event.media_revision,
+                                    ann_gen,
+                                )
                                 self.worker.notify()
 
         # Check if this event belongs to incidents and notify them to re-evaluate fusion
@@ -376,6 +389,13 @@ class VisionCoordinator:
         """Handle post-commit incident notification to enqueue visual fusion when eligible."""
         if not self.enable_fusion or not self.rec_api.store.is_open or not self.fusion_job_store:
             return
+
+        _LOGGER.debug(
+            "Received incident notification for %s (rev=%s, enable_fusion=%s)",
+            incident_id,
+            revision,
+            self.enable_fusion,
+        )
 
         async with self._get_incident_lock(incident_id):
             inputs = await self.rec_api.get_incident_inputs(incident_id, ANNOTATION_NAMESPACE)
@@ -429,12 +449,19 @@ class VisionCoordinator:
                 profile_payload=self.fusion_profile_payload,
             )
             if enqueued:
+                _LOGGER.debug(
+                    "Auto-enqueued fusion job for incident %s (input_token=%s, gen=%s)",
+                    incident_id,
+                    inputs.input_token,
+                    ann_gen,
+                )
                 self.worker.notify()
 
     async def async_manual_analyze(self, event_id: str) -> bool:
         """Handle manual retry: supersedes existing generation atomically."""
         if not self.rec_api.store.is_open:
             return False
+        _LOGGER.debug("Manual analysis requested for event %s", event_id)
         async with self._get_event_lock(event_id):
             event = await self.rec_api.get_event(event_id)
             if not event:
@@ -471,6 +498,8 @@ class VisionCoordinator:
         """Handle manual retry for incident: reserves annotation and enqueues manual job."""
         if not self.enable_fusion or not self.rec_api.store.is_open or not self.fusion_job_store:
             return False
+
+        _LOGGER.debug("Manual fusion analysis requested for incident %s", incident_id)
 
         async with self._get_incident_lock(incident_id):
             inputs = await self.rec_api.get_incident_inputs(incident_id, ANNOTATION_NAMESPACE)

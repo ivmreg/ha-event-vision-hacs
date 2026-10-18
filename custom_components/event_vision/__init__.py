@@ -19,6 +19,7 @@ from homeassistant.helpers.event import async_track_time_interval
 from .const import (
     CONF_AUTO_ANALYZE,
     CONF_CONCURRENCY,
+    CONF_ENABLE_DEBUG_LOGGING,
     CONF_ENABLE_FUSION,
     CONF_EXTRACTION_TIMEOUT,
     CONF_FRAME_CACHE_MB,
@@ -36,6 +37,7 @@ from .const import (
     CONF_SAMPLING_POLICY,
     DEFAULT_AUTO_ANALYZE,
     DEFAULT_CONCURRENCY,
+    DEFAULT_ENABLE_DEBUG_LOGGING,
     DEFAULT_ENABLE_FUSION,
     DEFAULT_EXTRACTION_TIMEOUT,
     DEFAULT_FRAME_CACHE_MB,
@@ -79,6 +81,7 @@ from .core.models import (
 )
 from .core.store import AnalysisJobStore
 from .core.worker import AnalysisWorker
+from .logging_util import configure_integration_logging
 from .services import async_register_services
 
 _LOGGER = logging.getLogger(__name__)
@@ -103,6 +106,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryNotReady("event_recording integration or API facade is not ready")
 
     config_data = {**entry.data, **entry.options}
+    enable_debug = bool(config_data.get(CONF_ENABLE_DEBUG_LOGGING, DEFAULT_ENABLE_DEBUG_LOGGING))
+    configure_integration_logging(enable_debug)
+
     api_key = str(config_data.get(CONF_GEMINI_API_KEY, "")).strip()
     model = str(config_data.get(CONF_MODEL, DEFAULT_MODEL)).strip() or DEFAULT_MODEL
     raw_auto_analyze = bool(config_data.get(CONF_AUTO_ANALYZE, DEFAULT_AUTO_ANALYZE))
@@ -294,6 +300,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Handle options or config entry update."""
+    config_data = {**entry.data, **entry.options}
+    enable_debug = bool(config_data.get(CONF_ENABLE_DEBUG_LOGGING, DEFAULT_ENABLE_DEBUG_LOGGING))
+    configure_integration_logging(enable_debug)
     await hass.config_entries.async_reload(entry.entry_id)
 
 

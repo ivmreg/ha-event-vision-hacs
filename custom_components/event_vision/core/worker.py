@@ -370,6 +370,13 @@ class AnalysisWorker:
             lease_sec = derive_queue_lease_seconds(self._job_deadline)
             job = await self._job_store.lease_job(self._worker_id, lease_seconds=lease_sec)
             if job:
+                _LOGGER.debug(
+                    "AnalysisWorker leased job %s for event %s (attempt=%d, lease=%.1fs)",
+                    job.id,
+                    job.event_id,
+                    job.attempts,
+                    lease_sec,
+                )
                 task = asyncio.create_task(self._guarded_execute(job))
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
@@ -381,6 +388,13 @@ class AnalysisWorker:
                     self._worker_id, lease_seconds=flease_sec
                 )
                 if fjob:
+                    _LOGGER.debug(
+                        "AnalysisWorker leased fusion job %s for incident %s (attempt=%d, lease=%.1fs)",
+                        fjob.id,
+                        fjob.incident_id,
+                        fjob.attempts,
+                        flease_sec,
+                    )
                     task = asyncio.create_task(self._guarded_execute_fusion(fjob))
                     self._background_tasks.add(task)
                     task.add_done_callback(self._background_tasks.discard)
@@ -565,6 +579,17 @@ class AnalysisWorker:
         job_provider_timeout = budget["provider_timeout"]
         job_extraction_timeout = budget["extraction_timeout"]
 
+        _LOGGER.debug(
+            "Starting execution for job %s: event=%s, gen=%s, model=%s, policy=%s, max_frames=%d, deadline=%.1fs",
+            job.id,
+            job.event_id,
+            job.generation,
+            job_model,
+            job_policy,
+            job_max_frames,
+            job_deadline,
+        )
+
         lease_pin = None
         try:
             # 3. Acquire media lease pin with derived duration bound
@@ -573,6 +598,12 @@ class AnalysisWorker:
                 event_id=job.event_id,
                 lease_seconds=lease_duration,
                 reason="event_vision analysis",
+            )
+            _LOGGER.debug(
+                "Acquired media lease pin for event %s (pin=%s, duration=%.1fs)",
+                job.event_id,
+                lease_pin,
+                lease_duration,
             )
 
             # 4. Set processing status via CAS using claimed generation
@@ -658,6 +689,15 @@ class AnalysisWorker:
             unselected_clips_count = max(0, available_clips_count - planned_clips_count)
             sampled_media_ids: set[str] = set()
 
+            _LOGGER.debug(
+                "Planned %d frame anchors across %d clips for event %s (policy=%s, available_clips=%d)",
+                planned_frames_count,
+                planned_clips_count,
+                job.event_id,
+                job_policy,
+                available_clips_count,
+            )
+
             media_by_id = {m.id: m for m in available_media}
             accumulated_frames: list[ExtractedFrame] = []
 
@@ -742,6 +782,16 @@ class AnalysisWorker:
                 source_time_uncertainty_seconds=capture_uncertainty,
             )
 
+            _LOGGER.debug(
+                "Frame extraction complete for event %s: extracted=%d/%d frames across %d/%d clips (state=%s)",
+                job.event_id,
+                extracted_frames_count,
+                planned_frames_count,
+                sampled_clips_count,
+                planned_clips_count,
+                obs_state,
+            )
+
             # 6. Call direct Gemini REST generateContent
             result = await self._gemini.generate_analysis(
                 frames=accumulated_frames,
@@ -801,6 +851,13 @@ class AnalysisWorker:
                     job.media_revision,
                     annotation_gen,
                 )
+                _LOGGER.debug(
+                    "Analysis complete committed for event %s: summary_len=%d, activity=%s, objects_count=%d",
+                    job.event_id,
+                    len(result.summary),
+                    result.activity,
+                    len(result.objects),
+                )
             else:
                 _LOGGER.warning(
                     "CAS commit rejected on completion for %s; stale generation or media revision",
@@ -818,6 +875,8 @@ class AnalysisWorker:
         finally:
             # 8. Release media lease pin in finally block
             await self._cleanup_media_pins([lease_pin] if lease_pin else [])
+            if lease_pin:
+                _LOGGER.debug("Released media lease pin %s for event %s", lease_pin, job.event_id)
 
     async def _cleanup_media_pins(self, pins: list[Any]) -> None:
         """Release acquired media pins under an owned task, awaiting settlement on cancel."""
