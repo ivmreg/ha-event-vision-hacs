@@ -18,6 +18,7 @@ import asyncio
 import logging
 import sqlite3
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +90,27 @@ class AnalysisJobStore:
         """Close SQLite connection cleanly."""
         await self._engine.close()
 
+    async def get_provider_cooldown(self, provider: str = "default") -> datetime | None:
+        """Return the datetime until which provider requests are cooled down, or None."""
+        return await self._engine.get_cooldown(key=provider)
+
+    async def extend_provider_cooldown(
+        self,
+        until_or_delay: datetime | str | float | int,
+        provider: str = "default",
+    ) -> datetime:
+        """Extend provider cooldown to max(existing, new_until), never shortening concurrent cooldown."""
+        return await self._engine.extend_cooldown(until_or_delay, key=provider)
+
+    async def clear_provider_cooldown(self, provider: str = "default") -> None:
+        """Clear provider cooldown for testing or administrative resets."""
+        await self._engine.clear_cooldown(key=provider)
+
+    # Public aliases for convenient caller access
+    get_cooldown = get_provider_cooldown
+    extend_cooldown = extend_provider_cooldown
+    clear_cooldown = clear_provider_cooldown
+
     async def enqueue_job(
         self,
         event_id: str,
@@ -131,9 +153,16 @@ class AnalysisJobStore:
         token: str | None = None,
     ) -> bool:
         """Mark job as complete with transactional CAS verification."""
-        effective_token = token if token is not None else (lease_token if lease_token is not None else claim_token)
+        effective_token = (
+            token
+            if token is not None
+            else (lease_token if lease_token is not None else claim_token)
+        )
         return await self._engine.complete(
-            job_id=job_id, generation=generation, claim_token=effective_token, lease_token=effective_token
+            job_id=job_id,
+            generation=generation,
+            claim_token=effective_token,
+            lease_token=effective_token,
         )
 
     async def fail_job(
@@ -148,7 +177,11 @@ class AnalysisJobStore:
         token: str | None = None,
     ) -> bool:
         """Fail job with CAS verification and exponential retry backoff."""
-        effective_token = token if token is not None else (lease_token if lease_token is not None else claim_token)
+        effective_token = (
+            token
+            if token is not None
+            else (lease_token if lease_token is not None else claim_token)
+        )
         return await self._engine.fail(
             job_id=job_id,
             generation=generation,
@@ -169,9 +202,17 @@ class AnalysisJobStore:
         token: str | None = None,
     ) -> bool:
         """Mark job as skipped with CAS verification."""
-        effective_token = token if token is not None else (lease_token if lease_token is not None else claim_token)
+        effective_token = (
+            token
+            if token is not None
+            else (lease_token if lease_token is not None else claim_token)
+        )
         return await self._engine.skip(
-            job_id=job_id, generation=generation, reason=reason, claim_token=effective_token, lease_token=effective_token
+            job_id=job_id,
+            generation=generation,
+            reason=reason,
+            claim_token=effective_token,
+            lease_token=effective_token,
         )
 
     async def defer_job(
@@ -184,9 +225,17 @@ class AnalysisJobStore:
         token: str | None = None,
     ) -> bool:
         """Defer job to pending without burning an attempt."""
-        effective_token = token if token is not None else (lease_token if lease_token is not None else claim_token)
+        effective_token = (
+            token
+            if token is not None
+            else (lease_token if lease_token is not None else claim_token)
+        )
         return await self._engine.defer(
-            job_id=job_id, generation=generation, delay_seconds=delay_seconds, claim_token=effective_token, lease_token=effective_token
+            job_id=job_id,
+            generation=generation,
+            delay_seconds=delay_seconds,
+            claim_token=effective_token,
+            lease_token=effective_token,
         )
 
     async def update_job_annotation_generation(
@@ -199,7 +248,11 @@ class AnalysisJobStore:
         token: str | None = None,
     ) -> bool:
         """Update annotation generation with CAS generation check."""
-        effective_token = token if token is not None else (lease_token if lease_token is not None else claim_token)
+        effective_token = (
+            token
+            if token is not None
+            else (lease_token if lease_token is not None else claim_token)
+        )
         return await self._engine.update_annotation_generation(
             job_id=job_id,
             generation=generation,
@@ -214,7 +267,9 @@ class AnalysisJobStore:
 
     async def supersede_older_revisions(self, event_id: str, current_media_revision: int) -> int:
         """Mark older jobs for event_id as superseded."""
-        return await asyncio.to_thread(self._sync_supersede_older_revisions, event_id, current_media_revision)
+        return await asyncio.to_thread(
+            self._sync_supersede_older_revisions, event_id, current_media_revision
+        )
 
     def _sync_supersede_older_revisions(self, event_id: str, current_media_revision: int) -> int:
         now_str = format_iso(utc_now()) or ""
@@ -242,9 +297,16 @@ class AnalysisJobStore:
         token: str | None = None,
     ) -> bool:
         """Retire only the rejected attempt, preserving newer jobs for the same media."""
-        effective_token = token if token is not None else (lease_token if lease_token is not None else claim_token)
+        effective_token = (
+            token
+            if token is not None
+            else (lease_token if lease_token is not None else claim_token)
+        )
         return await self._engine.supersede(
-            job_id=job_id, generation=generation, claim_token=effective_token, lease_token=effective_token
+            job_id=job_id,
+            generation=generation,
+            claim_token=effective_token,
+            lease_token=effective_token,
         )
 
     async def get_job(
@@ -254,9 +316,7 @@ class AnalysisJobStore:
         profile_digest: str,
     ) -> AnalysisJob | None:
         """Retrieve job by unique compound key."""
-        return await asyncio.to_thread(
-            self._sync_get_job, event_id, media_revision, profile_digest
-        )
+        return await asyncio.to_thread(self._sync_get_job, event_id, media_revision, profile_digest)
 
     def _sync_get_job(
         self,
@@ -325,9 +385,16 @@ class AnalysisJobStore:
         token: str | None = None,
     ) -> bool:
         """Return True if job is still active under the specified generation."""
-        effective_token = token if token is not None else (lease_token if lease_token is not None else claim_token)
+        effective_token = (
+            token
+            if token is not None
+            else (lease_token if lease_token is not None else claim_token)
+        )
         return await self._engine.is_current(
-            job_id=job_id, generation=generation, claim_token=effective_token, lease_token=effective_token
+            job_id=job_id,
+            generation=generation,
+            claim_token=effective_token,
+            lease_token=effective_token,
         )
 
     async def recover_expired_leases(self, force_all: bool = False) -> int:
@@ -342,9 +409,7 @@ class AnalysisJobStore:
         """Return True if any pending or leased jobs exist."""
         return await self._engine.has_pending_or_leased()
 
-    async def migrate_legacy_pending_jobs(
-        self, profile_digest: str, profile_payload: str
-    ) -> int:
+    async def migrate_legacy_pending_jobs(self, profile_digest: str, profile_payload: str) -> int:
         """Migrate legacy pending or leased jobs without profile payload to current profile key.
 
         Leaves historical completed, skipped, or failed archive results untouched.
@@ -390,7 +455,9 @@ class AnalysisJobStore:
                     target_row = cur.fetchone()
                     target_existing = None
                     if target_row:
-                        if target_row["profile_payload"] is not None or target_row["status"] not in (
+                        if target_row["profile_payload"] is not None or target_row[
+                            "status"
+                        ] not in (
                             "pending",
                             "leased",
                         ):
@@ -411,7 +478,10 @@ class AnalysisJobStore:
 
                     if target_existing:
                         if target_existing["status"] in ("pending", "leased"):
-                            if any(c["is_manual"] for c in candidates) and not target_existing["is_manual"]:
+                            if (
+                                any(c["is_manual"] for c in candidates)
+                                and not target_existing["is_manual"]
+                            ):
                                 cur.execute(
                                     "UPDATE analysis_jobs SET is_manual = 1, updated_at = ? WHERE id = ?;",
                                     (now_str, target_existing["id"]),
@@ -435,7 +505,13 @@ class AnalysisJobStore:
                             SET profile_digest = ?, profile_payload = ?, is_manual = ?, updated_at = ?
                             WHERE id = ?;
                             """,
-                            (profile_digest, profile_payload, winner_is_manual, now_str, winner["id"]),
+                            (
+                                profile_digest,
+                                profile_payload,
+                                winner_is_manual,
+                                now_str,
+                                winner["id"],
+                            ),
                         )
                         migrated_count += 1
 
@@ -490,7 +566,9 @@ class AnalysisJobStore:
             attempts=row["attempts"],
             leased_by=row["leased_by"],
             leased_until=ensure_utc(row["leased_until"]) if row.get("leased_until") else None,
-            next_attempt_at=ensure_utc(row["next_attempt_at"]) if row.get("next_attempt_at") else None,
+            next_attempt_at=ensure_utc(row["next_attempt_at"])
+            if row.get("next_attempt_at")
+            else None,
             last_error=row["last_error"],
             is_manual=bool(row["is_manual"]),
             created_at=ensure_utc(row["created_at"]) if row.get("created_at") else utc_now(),

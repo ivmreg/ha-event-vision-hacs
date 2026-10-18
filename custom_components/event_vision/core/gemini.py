@@ -13,10 +13,13 @@ Features:
 from __future__ import annotations
 
 import base64
+import email.utils
 import json
 import logging
+import math
 import re
 import urllib.parse
+from datetime import UTC
 from typing import Any
 
 import aiohttp
@@ -29,6 +32,7 @@ from ..const import (
     MAX_OBJECT_LEN,
     MAX_OBJECTS,
     MAX_PROMPT_INSTRUCTIONS_LEN,
+    MAX_RETRY_AFTER_SECONDS,
     MAX_SUMMARY_LEN,
 )
 from .models import (
@@ -39,15 +43,72 @@ from .models import (
     FusionViewInput,
     GeminiKeyError,
     GeminiSchemaError,
+    utc_now,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def parse_retry_after(
+    header_val: str | None, max_delay: float = MAX_RETRY_AFTER_SECONDS
+) -> float | None:
+    """Parse HTTP Retry-After header (seconds or HTTP-date) into bounded numeric delay in seconds.
+
+    Validates max_delay is a finite non-negative number capped by MAX_RETRY_AFTER_SECONDS.
+    Returns None if header is absent, empty, or unparseable.
+    Never logs headers or response bodies.
+    Guarantees result is finite, non-negative, and <= effective max_delay.
+    """
+    if isinstance(max_delay, bool) or not isinstance(max_delay, (int, float)):
+        raise ValueError("max_delay must be a finite non-negative number")
+    max_cap = float(max_delay)
+    if math.isnan(max_cap) or not math.isfinite(max_cap) or max_cap < 0.0:
+        raise ValueError("max_delay must be a finite non-negative number")
+    effective_max = min(max_cap, float(MAX_RETRY_AFTER_SECONDS))
+
+    if header_val is None or not isinstance(header_val, str):
+        return None
+    val = header_val.strip().strip('"')
+    if not val:
+        return None
+
+    # 1. Try integer/float seconds
+    try:
+        delay = float(val)
+        if math.isnan(delay) or not math.isfinite(delay):
+            return None
+        if delay < 0.0:
+            return 0.0
+        return min(delay, effective_max)
+    except (ValueError, OverflowError):
+        pass
+
+    # 2. Try HTTP-date format (RFC 7231 / RFC 9110)
+    try:
+        dt = email.utils.parsedate_to_datetime(val)
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            now = utc_now()
+            diff = (dt - now).total_seconds()
+            if not math.isfinite(diff) or math.isnan(diff):
+                return None
+            if diff < 0.0:
+                return 0.0
+            return min(diff, effective_max)
+    except Exception:
+        pass
+
+    return None
+
 
 GEMINI_HOST = "generativelanguage.googleapis.com"
 
 # Regex patterns to detect disallowed private data in provider requests
 _PRIVATE_URL_PATTERN = re.compile(r"https?://|ftp://", re.IGNORECASE)
-_PRIVATE_PATH_PATTERN = re.compile(r"(?:[a-zA-Z]:[\\/]|/(?:config|var|tmp|home|etc|media)/)", re.IGNORECASE)
+_PRIVATE_PATH_PATTERN = re.compile(
+    r"(?:[a-zA-Z]:[\\/]|/(?:config|var|tmp|home|etc|media)/)", re.IGNORECASE
+)
 _PRIVATE_ENTITY_PATTERN = re.compile(
     r"\b(?:camera|event_recording|event_vision|sensor|switch|binary_sensor)\.[a-z0-9_]+\b",
     re.IGNORECASE,
@@ -57,12 +118,20 @@ _PRIVATE_ENTITY_PATTERN = re.compile(
 def verify_privacy_clean(text: str) -> None:
     """Verify that no private URLs, local file paths, or HA entity IDs leak into provider requests."""
     if _PRIVATE_URL_PATTERN.search(text):
-        raise AnalysisError("PRIVACY_LEAK_PREVENTED", "Disallowed URL found in provider request", retryable=False)
+        raise AnalysisError(
+            "PRIVACY_LEAK_PREVENTED", "Disallowed URL found in provider request", retryable=False
+        )
     if _PRIVATE_PATH_PATTERN.search(text):
-        raise AnalysisError("PRIVACY_LEAK_PREVENTED", "Disallowed local file path found in provider request", retryable=False)
+        raise AnalysisError(
+            "PRIVACY_LEAK_PREVENTED",
+            "Disallowed local file path found in provider request",
+            retryable=False,
+        )
     if _PRIVATE_ENTITY_PATTERN.search(text):
         raise AnalysisError(
-            "PRIVACY_LEAK_PREVENTED", "Disallowed HA entity identifier found in provider request", retryable=False
+            "PRIVACY_LEAK_PREVENTED",
+            "Disallowed HA entity identifier found in provider request",
+            retryable=False,
         )
 
 
@@ -110,7 +179,9 @@ class GeminiClient:
         url = f"https://{GEMINI_HOST}/v1beta/models/{encoded_model}:generateContent"
         parsed = urllib.parse.urlparse(url)
         if parsed.netloc != GEMINI_HOST:
-            raise AnalysisError("SECURITY_ERROR", "Invalid host in Gemini URL construction.", retryable=False)
+            raise AnalysisError(
+                "SECURITY_ERROR", "Invalid host in Gemini URL construction.", retryable=False
+            )
         return url
 
     async def generate_analysis(
@@ -185,21 +256,46 @@ class GeminiClient:
                     raw_json = await resp.json()
                     return self._parse_and_validate_response(raw_json)
 
+                retry_after_raw = resp.headers.get("Retry-After")
+                retry_delay = parse_retry_after(retry_after_raw)
+
                 if status == 429:
-                    raise AnalysisError("RATE_LIMIT", "Gemini 429 rate limit exceeded", retryable=True)
+                    raise AnalysisError(
+                        "RATE_LIMIT",
+                        "Gemini 429 rate limit exceeded",
+                        retryable=True,
+                        retry_delay=retry_delay,
+                    )
 
                 if status in (500, 502, 503, 504):
-                    raise AnalysisError(f"HTTP_{status}", f"Gemini server error {status}", retryable=True)
+                    raise AnalysisError(
+                        f"HTTP_{status}",
+                        f"Gemini server error {status}",
+                        retryable=True,
+                        retry_delay=retry_delay,
+                    )
 
                 if status in (400, 401, 403):
-                    raise AnalysisError(f"HTTP_{status}", f"Gemini client authentication error {status}", retryable=False)
+                    raise AnalysisError(
+                        f"HTTP_{status}",
+                        f"Gemini client authentication error {status}",
+                        retryable=False,
+                    )
 
-                raise AnalysisError(f"HTTP_{status}", f"Unexpected status from Gemini: {status}", retryable=False)
+                raise AnalysisError(
+                    f"HTTP_{status}",
+                    f"Unexpected status from Gemini: {status}",
+                    retryable=False,
+                )
 
         except TimeoutError as err:
-            raise AnalysisError("TIMEOUT", "Gemini request timed out", retryable=True) from err
+            raise AnalysisError(
+                "TIMEOUT", "Gemini request timed out", retryable=True, timeout_source="provider"
+            ) from err
         except aiohttp.ClientError as err:
-            raise AnalysisError("NETWORK_ERROR", "Network error connecting to Gemini", retryable=True) from err
+            raise AnalysisError(
+                "NETWORK_ERROR", "Network error connecting to Gemini", retryable=True
+            ) from err
 
     def _parse_and_validate_response(self, raw_resp: dict[str, Any]) -> AnalysisResult:
         """Validate structure and fields of the Gemini JSON response."""
@@ -207,30 +303,44 @@ class GeminiClient:
             model_version = raw_resp.get("modelVersion")
             candidates = raw_resp.get("candidates", [])
             if not candidates:
-                raise GeminiSchemaError("EMPTY_RESPONSE", "No candidates in Gemini response", retryable=False)
+                raise GeminiSchemaError(
+                    "EMPTY_RESPONSE", "No candidates in Gemini response", retryable=False
+                )
 
             content = candidates[0].get("content", {})
             parts = content.get("parts", [])
             if not parts:
-                raise GeminiSchemaError("EMPTY_RESPONSE", "No parts in candidate content", retryable=False)
+                raise GeminiSchemaError(
+                    "EMPTY_RESPONSE", "No parts in candidate content", retryable=False
+                )
 
             text_str = parts[0].get("text", "")
             if not text_str or not text_str.strip():
-                raise GeminiSchemaError("EMPTY_RESPONSE", "Empty text in candidate parts", retryable=False)
+                raise GeminiSchemaError(
+                    "EMPTY_RESPONSE", "Empty text in candidate parts", retryable=False
+                )
 
             data = json.loads(text_str)
             if not isinstance(data, dict):
-                raise GeminiSchemaError("MALFORMED_RESPONSE", "Model response is not a JSON object", retryable=False)
+                raise GeminiSchemaError(
+                    "MALFORMED_RESPONSE", "Model response is not a JSON object", retryable=False
+                )
 
             summary = data.get("summary")
             activity = data.get("activity")
             raw_objects = data.get("objects", [])
 
             if not isinstance(summary, str) or not (1 <= len(summary.strip()) <= MAX_SUMMARY_LEN):
-                raise GeminiSchemaError("MALFORMED_RESPONSE", f"Summary must be string 1..{MAX_SUMMARY_LEN} chars", retryable=False)
+                raise GeminiSchemaError(
+                    "MALFORMED_RESPONSE",
+                    f"Summary must be string 1..{MAX_SUMMARY_LEN} chars",
+                    retryable=False,
+                )
 
             if not isinstance(activity, bool):
-                raise GeminiSchemaError("MALFORMED_RESPONSE", "activity must be a boolean", retryable=False)
+                raise GeminiSchemaError(
+                    "MALFORMED_RESPONSE", "activity must be a boolean", retryable=False
+                )
 
             objects: list[str] = []
             if isinstance(raw_objects, list):
@@ -245,11 +355,15 @@ class GeminiClient:
                 model_version=str(model_version).strip() if model_version else None,
             )
         except json.JSONDecodeError as err:
-            raise GeminiSchemaError("MALFORMED_RESPONSE", f"Malformed JSON from model: {err}", retryable=False) from err
+            raise GeminiSchemaError(
+                "MALFORMED_RESPONSE", f"Malformed JSON from model: {err}", retryable=False
+            ) from err
         except GeminiSchemaError:
             raise
         except Exception as err:
-            raise GeminiSchemaError("SCHEMA_ERROR", f"Error validating schema: {err}", retryable=False) from err
+            raise GeminiSchemaError(
+                "SCHEMA_ERROR", f"Error validating schema: {err}", retryable=False
+            ) from err
 
     async def generate_fusion_analysis(
         self,
@@ -388,21 +502,49 @@ class GeminiClient:
                     raw_json = await resp.json()
                     return self._parse_and_validate_fusion_response(raw_json, valid_refs=valid_refs)
 
+                retry_after_raw = resp.headers.get("Retry-After")
+                retry_delay = parse_retry_after(retry_after_raw)
+
                 if status == 429:
-                    raise AnalysisError("RATE_LIMIT", "Gemini 429 rate limit exceeded", retryable=True)
+                    raise AnalysisError(
+                        "RATE_LIMIT",
+                        "Gemini 429 rate limit exceeded",
+                        retryable=True,
+                        retry_delay=retry_delay,
+                    )
 
                 if status in (500, 502, 503, 504):
-                    raise AnalysisError(f"HTTP_{status}", f"Gemini server error {status}", retryable=True)
+                    raise AnalysisError(
+                        f"HTTP_{status}",
+                        f"Gemini server error {status}",
+                        retryable=True,
+                        retry_delay=retry_delay,
+                    )
 
                 if status in (400, 401, 403):
-                    raise AnalysisError(f"HTTP_{status}", f"Gemini client authentication error {status}", retryable=False)
+                    raise AnalysisError(
+                        f"HTTP_{status}",
+                        f"Gemini client authentication error {status}",
+                        retryable=False,
+                    )
 
-                raise AnalysisError(f"HTTP_{status}", f"Unexpected status from Gemini: {status}", retryable=False)
+                raise AnalysisError(
+                    f"HTTP_{status}",
+                    f"Unexpected status from Gemini: {status}",
+                    retryable=False,
+                )
 
         except TimeoutError as err:
-            raise AnalysisError("TIMEOUT", "Gemini fusion request timed out", retryable=True) from err
+            raise AnalysisError(
+                "TIMEOUT",
+                "Gemini fusion request timed out",
+                retryable=True,
+                timeout_source="provider",
+            ) from err
         except aiohttp.ClientError as err:
-            raise AnalysisError("NETWORK_ERROR", "Network error connecting to Gemini", retryable=True) from err
+            raise AnalysisError(
+                "NETWORK_ERROR", "Network error connecting to Gemini", retryable=True
+            ) from err
 
     def _parse_and_validate_fusion_response(
         self,
@@ -414,26 +556,36 @@ class GeminiClient:
             model_version = raw_resp.get("modelVersion") or self._model
             candidates = raw_resp.get("candidates", [])
             if not candidates:
-                raise GeminiSchemaError("EMPTY_RESPONSE", "No candidates in Gemini response", retryable=False)
+                raise GeminiSchemaError(
+                    "EMPTY_RESPONSE", "No candidates in Gemini response", retryable=False
+                )
 
             content = candidates[0].get("content", {})
             parts = content.get("parts", [])
             if not parts:
-                raise GeminiSchemaError("EMPTY_RESPONSE", "No parts in candidate content", retryable=False)
+                raise GeminiSchemaError(
+                    "EMPTY_RESPONSE", "No parts in candidate content", retryable=False
+                )
 
             text_str = parts[0].get("text", "")
             if not text_str or not text_str.strip():
-                raise GeminiSchemaError("EMPTY_RESPONSE", "Empty text in candidate parts", retryable=False)
+                raise GeminiSchemaError(
+                    "EMPTY_RESPONSE", "Empty text in candidate parts", retryable=False
+                )
 
             data = json.loads(text_str)
             if not isinstance(data, dict):
-                raise GeminiSchemaError("MALFORMED_RESPONSE", "Model response is not a JSON object", retryable=False)
+                raise GeminiSchemaError(
+                    "MALFORMED_RESPONSE", "Model response is not a JSON object", retryable=False
+                )
 
             narrative = data.get("narrative")
             activity = data.get("activity")
             raw_matches = data.get("possible_cross_view_matches", [])
 
-            if not isinstance(narrative, str) or not (1 <= len(narrative.strip()) <= MAX_SUMMARY_LEN * 2):
+            if not isinstance(narrative, str) or not (
+                1 <= len(narrative.strip()) <= MAX_SUMMARY_LEN * 2
+            ):
                 raise GeminiSchemaError(
                     "MALFORMED_RESPONSE",
                     f"Narrative must be string 1..{MAX_SUMMARY_LEN * 2} chars",
@@ -441,7 +593,9 @@ class GeminiClient:
                 )
 
             if not isinstance(activity, bool):
-                raise GeminiSchemaError("MALFORMED_RESPONSE", "activity must be a boolean", retryable=False)
+                raise GeminiSchemaError(
+                    "MALFORMED_RESPONSE", "activity must be a boolean", retryable=False
+                )
 
             matches: list[dict[str, Any]] = []
             if isinstance(raw_matches, list):
@@ -472,7 +626,9 @@ class GeminiClient:
                     if uncertainty not in ("low", "medium", "high"):
                         uncertainty = "medium"
 
-                    confidence = str(match.get("same_subject_confidence", "uncertain")).lower().strip()
+                    confidence = (
+                        str(match.get("same_subject_confidence", "uncertain")).lower().strip()
+                    )
                     if confidence not in ("unlikely", "possible", "uncertain"):
                         confidence = "uncertain"
 
@@ -492,8 +648,12 @@ class GeminiClient:
                 model_version=str(model_version).strip(),
             )
         except json.JSONDecodeError as err:
-            raise GeminiSchemaError("MALFORMED_RESPONSE", f"Malformed JSON from model: {err}", retryable=False) from err
+            raise GeminiSchemaError(
+                "MALFORMED_RESPONSE", f"Malformed JSON from model: {err}", retryable=False
+            ) from err
         except (GeminiSchemaError, AnalysisError):
             raise
         except Exception as err:
-            raise GeminiSchemaError("SCHEMA_ERROR", f"Error validating fusion schema: {err}", retryable=False) from err
+            raise GeminiSchemaError(
+                "SCHEMA_ERROR", f"Error validating fusion schema: {err}", retryable=False
+            ) from err

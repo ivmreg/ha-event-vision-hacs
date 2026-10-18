@@ -195,6 +195,7 @@ class VisionCoordinator:
         self._unsub_recording = rec_api.subscribe(_on_event_change)
 
         if hasattr(rec_api, "subscribe_incidents"):
+
             def _on_incident_change(incident_id: str, revision: int) -> None:
                 task = asyncio.create_task(
                     self.async_handle_incident_notification(incident_id, revision)
@@ -275,7 +276,10 @@ class VisionCoordinator:
                     if not event or event.media_revision != media_rev:
                         continue
                     ann = event.annotations.get(ANNOTATION_NAMESPACE, {})
-                    if ann.get("status") in (STATUS_COMPLETE, STATUS_SKIPPED, STATUS_FAILED):
+                    if (
+                        ann.get("status") in (STATUS_COMPLETE, STATUS_SKIPPED, STATUS_FAILED)
+                        and ann.get("media_revision") == media_rev
+                    ):
                         continue
 
                     ann_gen = await self.rec_api.store.reserve_annotation(
@@ -394,7 +398,13 @@ class VisionCoordinator:
             existing_job = await self.fusion_job_store.get_job_by_inputs(
                 incident_id, inputs.input_token, self.fusion_profile_digest
             )
-            if existing_job and existing_job.status in ("pending", "leased", "complete", "skipped", "failed"):
+            if existing_job and existing_job.status in (
+                "pending",
+                "leased",
+                "complete",
+                "skipped",
+                "failed",
+            ):
                 return
 
             res_ttl = derive_reservation_ttl(self.fusion_job_deadline)

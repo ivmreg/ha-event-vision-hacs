@@ -19,8 +19,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import random
 from dataclasses import replace
+from datetime import timedelta
 from typing import Any
+from weakref import WeakValueDictionary
 
 from ..const import (
     ANNOTATION_NAMESPACE,
@@ -34,6 +38,7 @@ from ..const import (
     DEFAULT_PROVIDER_TIMEOUT,
     DEFAULT_SAMPLING_POLICY,
     GENERIC_MEDIA_PROMPT,
+    MAX_BACKOFF_SECONDS,
     MAX_FRAMES_BUDGET,
     MAX_FUSION_MAX_FRAMES,
     MIN_FRAMES,
@@ -54,11 +59,13 @@ from .models import (
     AnalysisError,
     AnalysisJob,
     ExtractedFrame,
+    FrameExtractionError,
     FusionAnnotation,
     FusionJob,
     FusionViewFrame,
     FusionViewInput,
     IncidentInputs,
+    ObservationCoverage,
     build_job_payload,
     canonical_profile_json,
     compute_profile_digest,
@@ -75,6 +82,81 @@ from .sampling import plan_event_sampling
 from .store import AnalysisJobStore
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def is_retryable_provider_error(err: Exception) -> bool:
+    """Return True only for retryable provider/network classes.
+
+    Recognizes RATE_LIMIT (429), HTTP_5xx server errors, NETWORK_ERROR,
+    and provider timeout (explicitly tagged via timeout_source='provider').
+    Excludes job deadline timeout (timeout_source='job'), extraction errors,
+    media unavailable, invalid profile, and permanent client errors (400, 401, 403).
+    """
+    if not isinstance(err, AnalysisError):
+        return False
+    if not err.retryable or isinstance(err, FrameExtractionError):
+        return False
+
+    timeout_source = getattr(err, "timeout_source", None)
+    if timeout_source is not None:
+        return timeout_source == "provider"
+
+    code = err.code.upper()
+    if code in (
+        "JOB_TIMEOUT",
+        "FRAME_EXTRACTION_FAILED",
+        "MEDIA_UNAVAILABLE",
+        "INVALID_PROFILE",
+        "SCHEMA_ERROR",
+        "PRIVACY_LEAK_PREVENTED",
+    ):
+        return False
+    if "RATE_LIMIT" in code or "429" in code:
+        return True
+    if any(code.startswith(f"HTTP_{s}") for s in (500, 502, 503, 504)) or code == "HTTP_5XX":
+        return True
+    if "NETWORK" in code or "CONNECTION" in code:
+        return True
+    if code in ("PROVIDER_TIMEOUT", "TIMEOUT"):
+        return True
+    return False
+
+
+def compute_retry_delay(
+    attempts: int,
+    retry_delay: float | None = None,
+    base_backoff: float = BASE_BACKOFF_SECONDS,
+    max_backoff: float = MAX_BACKOFF_SECONDS,
+    apply_jitter: bool = True,
+) -> float:
+    """Compute bounded retry delay honoring provider Retry-After or exponential backoff + jitter."""
+    if isinstance(base_backoff, bool) or not isinstance(base_backoff, (int, float)):
+        raise ValueError("base_backoff must be a finite positive number")
+    if isinstance(max_backoff, bool) or not isinstance(max_backoff, (int, float)):
+        raise ValueError("max_backoff must be a finite positive number")
+    base_val = float(base_backoff)
+    max_val = float(max_backoff)
+    if math.isnan(base_val) or not math.isfinite(base_val) or base_val <= 0.0:
+        raise ValueError("base_backoff must be a finite positive number")
+    if math.isnan(max_val) or not math.isfinite(max_val) or max_val <= 0.0:
+        raise ValueError("max_backoff must be a finite positive number")
+    effective_max = min(max_val, float(MAX_BACKOFF_SECONDS))
+
+    if retry_delay is not None:
+        if (
+            not isinstance(retry_delay, bool)
+            and isinstance(retry_delay, (int, float))
+            and math.isfinite(retry_delay)
+            and not math.isnan(retry_delay)
+        ):
+            if retry_delay > 0:
+                return min(effective_max, float(retry_delay))
+
+    exp_delay = min(effective_max, base_val * (2.0 ** max(0, attempts)))
+    if apply_jitter:
+        jitter = random.uniform(0.0, min(10.0, 0.1 * exp_delay))
+        return min(effective_max, exp_delay + jitter)
+    return exp_delay
 
 
 class AnalysisWorker:
@@ -140,16 +222,24 @@ class AnalysisWorker:
         self._wake_event = asyncio.Event()
         self._semaphore = asyncio.Semaphore(max(1, min(concurrency, 4)))
         self._background_tasks: set[asyncio.Task[None]] = set()
-        self.event_locks: dict[str, asyncio.Lock] = {}
-        self.incident_locks: dict[str, asyncio.Lock] = {}
+        self.event_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+        self.incident_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
     def event_lock(self, event_id: str) -> asyncio.Lock:
         """Serialize short queue/reservation transitions with manual retries."""
-        return self.event_locks.setdefault(event_id, asyncio.Lock())
+        lock = self.event_locks.get(event_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.event_locks[event_id] = lock
+        return lock
 
     def incident_lock(self, incident_id: str) -> asyncio.Lock:
         """Serialize short queue/reservation transitions for an incident."""
-        return self.incident_locks.setdefault(incident_id, asyncio.Lock())
+        lock = self.incident_locks.get(incident_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.incident_locks[incident_id] = lock
+        return lock
 
     @property
     def cache(self) -> FrameCache | None:
@@ -265,6 +355,11 @@ class AnalysisWorker:
         if self._semaphore.locked():
             return False
 
+        # Check shared provider cooldown before leasing
+        cooldown_until = await self._job_store.get_provider_cooldown()
+        if cooldown_until is not None and cooldown_until > utc_now():
+            return False
+
         try:
             await self._semaphore.acquire()
         except Exception:
@@ -324,7 +419,13 @@ class AnalysisWorker:
             except TimeoutError:
                 _LOGGER.warning("Job %s timed out after %ss deadline", job.event_id, job_deadline)
                 await self._handle_job_failure(
-                    job, AnalysisError("TIMEOUT", "Execution deadline exceeded", retryable=True)
+                    job,
+                    AnalysisError(
+                        "TIMEOUT",
+                        "Execution deadline exceeded",
+                        retryable=True,
+                        timeout_source="job",
+                    ),
                 )
             except asyncio.CancelledError:
                 _LOGGER.info("Job %s cancelled during execution; leaving recoverable", job.event_id)
@@ -339,7 +440,9 @@ class AnalysisWorker:
 
     async def _execute_job(self, job: AnalysisJob) -> None:
         """Execute single analysis job with derived media lease pin and CAS protection."""
-        if not await self._job_store.is_job_current(job.id, job.generation, claim_token=job.claim_token):
+        if not await self._job_store.is_job_current(
+            job.id, job.generation, claim_token=job.claim_token
+        ):
             _LOGGER.info(
                 "Job %s (gen %s) is no longer current; aborting execution",
                 job.event_id,
@@ -347,20 +450,39 @@ class AnalysisWorker:
             )
             return
 
-        # 1. Ensure annotation reservation exists under per-event lock BEFORE payload validation
+        res_deadline = self._job_deadline
+        if job.profile_payload:
+            try:
+                p_data = json.loads(job.profile_payload)
+                b_data = p_data.get("budget") if isinstance(p_data, dict) else None
+                if isinstance(b_data, dict) and "job_deadline" in b_data:
+                    res_deadline = float(b_data["job_deadline"])
+            except Exception:
+                pass
+        res_ttl = derive_reservation_ttl(res_deadline)
+
+        # 1. Ensure or renew annotation reservation under per-event lock BEFORE payload validation
         async with self.event_lock(job.event_id):
-            if not await self._job_store.is_job_current(job.id, job.generation, claim_token=job.claim_token):
+            if not await self._job_store.is_job_current(
+                job.id, job.generation, claim_token=job.claim_token
+            ):
                 return
             event = await self._rec_api.get_event(job.event_id)
             if not event or event.media_revision != job.media_revision:
-                await self._job_store.supersede_job(job.id, job.generation, claim_token=job.claim_token)
+                await self._job_store.supersede_job(
+                    job.id, job.generation, claim_token=job.claim_token
+                )
                 return
             existing_ann = event.annotations.get(ANNOTATION_NAMESPACE, {})
             existing_gen = existing_ann.get("generation", 0)
 
             annotation_gen = job.annotation_generation
-            if annotation_gen is None or existing_gen == 0:
-                res_ttl = derive_reservation_ttl(self._job_deadline)
+            if existing_gen == 0:
+                if annotation_gen not in (None, 1):
+                    await self._job_store.supersede_job(
+                        job.id, job.generation, claim_token=job.claim_token
+                    )
+                    return
                 annotation_gen = await self._rec_api.store.reserve_annotation(
                     event_id=job.event_id,
                     namespace=ANNOTATION_NAMESPACE,
@@ -369,16 +491,33 @@ class AnalysisWorker:
                     ttl_seconds=res_ttl,
                 )
                 if annotation_gen is None:
-                    await self._job_store.supersede_job(job.id, job.generation, claim_token=job.claim_token)
+                    await self._job_store.supersede_job(
+                        job.id, job.generation, claim_token=job.claim_token
+                    )
                     return
                 await self._job_store.update_job_annotation_generation(
                     job.id, job.generation, annotation_gen, claim_token=job.claim_token
                 )
                 job = replace(job, annotation_generation=annotation_gen)
             else:
-                annotation_gen = existing_gen
-                if job.annotation_generation != annotation_gen:
-                    job = replace(job, annotation_generation=annotation_gen)
+                if annotation_gen is None or existing_gen != annotation_gen:
+                    await self._job_store.supersede_job(
+                        job.id, job.generation, claim_token=job.claim_token
+                    )
+                    return
+                renewed = await self._rec_api.store.renew_annotation_reservation(
+                    event_id=job.event_id,
+                    namespace=ANNOTATION_NAMESPACE,
+                    expected_media_revision=job.media_revision,
+                    expected_generation=annotation_gen,
+                    worker_id=self._worker_id,
+                    ttl_seconds=res_ttl,
+                )
+                if not renewed:
+                    await self._job_store.supersede_job(
+                        job.id, job.generation, claim_token=job.claim_token
+                    )
+                    return
 
         # 2. Resolve effective profile parameters strictly from durable job snapshot
         if not job.profile_payload:
@@ -438,7 +577,9 @@ class AnalysisWorker:
 
             # 4. Set processing status via CAS using claimed generation
             async with self.event_lock(job.event_id):
-                if not await self._job_store.is_job_current(job.id, job.generation, claim_token=job.claim_token):
+                if not await self._job_store.is_job_current(
+                    job.id, job.generation, claim_token=job.claim_token
+                ):
                     return
 
                 proc_annotation = AnalysisAnnotation(
@@ -466,12 +607,16 @@ class AnalysisWorker:
             event = await self._rec_api.get_event(job.event_id)
             if not event or event.media_revision != job.media_revision:
                 _LOGGER.warning("Event %s changed media revision mid-run", job.event_id)
-                await self._job_store.supersede_job(job.id, job.generation, claim_token=job.claim_token)
+                await self._job_store.supersede_job(
+                    job.id, job.generation, claim_token=job.claim_token
+                )
                 return
 
             available_media = [m for m in event.media if getattr(m, "available", True)]
             if not available_media:
-                if not await self._job_store.is_job_current(job.id, job.generation, claim_token=job.claim_token):
+                if not await self._job_store.is_job_current(
+                    job.id, job.generation, claim_token=job.claim_token
+                ):
                     return
                 skip_annotation = AnalysisAnnotation(
                     status=STATUS_SKIPPED,
@@ -506,6 +651,12 @@ class AnalysisWorker:
             anchors_by_media: dict[str, list[Any]] = {}
             for a in planned_anchors:
                 anchors_by_media.setdefault(a.media_id, []).append(a)
+
+            available_clips_count = len(available_media)
+            planned_frames_count = min(len(planned_anchors), job_max_frames)
+            planned_clips_count = len(anchors_by_media)
+            unselected_clips_count = max(0, available_clips_count - planned_clips_count)
+            sampled_media_ids: set[str] = set()
 
             media_by_id = {m.id: m for m in available_media}
             accumulated_frames: list[ExtractedFrame] = []
@@ -546,7 +697,9 @@ class AnalysisWorker:
                         offset_quality=offset_q,
                         media_revision=job.media_revision,
                     )
-                    accumulated_frames.extend(frames)
+                    if frames:
+                        accumulated_frames.extend(frames)
+                        sampled_media_ids.add(m_id)
                 except Exception as err:
                     _LOGGER.warning(
                         "Frame extraction error on media %s: %s", m_id, sanitize_error_code(err)
@@ -559,6 +712,35 @@ class AnalysisWorker:
 
             # Trim strictly to configured max_frames
             accumulated_frames = accumulated_frames[:job_max_frames]
+            extracted_frames_count = len(accumulated_frames)
+            sampled_clips_count = len(sampled_media_ids)
+            missing_clips_count = max(0, planned_clips_count - sampled_clips_count)
+            is_complete_obs = (
+                extracted_frames_count == planned_frames_count and missing_clips_count == 0
+            )
+            obs_state = "complete" if is_complete_obs else "partial"
+
+            capture_state = getattr(event, "capture_state", None)
+            uncertainties = [
+                getattr(m, "time_uncertainty_seconds", None)
+                for m in available_media
+                if getattr(m, "time_uncertainty_seconds", None) is not None
+            ]
+            capture_uncertainty = max(uncertainties) if uncertainties else None
+
+            coverage_meta = ObservationCoverage(
+                planned_frames=planned_frames_count,
+                extracted_frames=extracted_frames_count,
+                planned_clips=planned_clips_count,
+                sampled_clips=sampled_clips_count,
+                missing_clips=missing_clips_count,
+                observation_state=obs_state,
+                is_partial=not is_complete_obs,
+                available_clips=available_clips_count,
+                unselected_clips=unselected_clips_count,
+                source_capture_state=capture_state,
+                source_time_uncertainty_seconds=capture_uncertainty,
+            )
 
             # 6. Call direct Gemini REST generateContent
             result = await self._gemini.generate_analysis(
@@ -570,7 +752,9 @@ class AnalysisWorker:
             )
 
             # 7. Post CAS complete state with frame provenance and returned modelVersion
-            if not await self._job_store.is_job_current(job.id, job.generation, claim_token=job.claim_token):
+            if not await self._job_store.is_job_current(
+                job.id, job.generation, claim_token=job.claim_token
+            ):
                 _LOGGER.warning(
                     "Job %s superseded before complete commit; skipping CAS", job.event_id
                 )
@@ -596,6 +780,7 @@ class AnalysisWorker:
                 model_version=getattr(result, "model_version", None),
                 updated_at=format_iso(utc_now()),
                 frames=frames_provenance,
+                coverage=coverage_meta,
             )
 
             committed = await self._rec_api.store.set_annotation_cas(
@@ -607,7 +792,9 @@ class AnalysisWorker:
             )
 
             if committed:
-                await self._job_store.complete_job(job.id, job.generation, claim_token=job.claim_token)
+                await self._job_store.complete_job(
+                    job.id, job.generation, claim_token=job.claim_token
+                )
                 _LOGGER.info(
                     "Successfully analyzed and committed event %s (media_rev=%s, gen=%s)",
                     job.event_id,
@@ -619,7 +806,9 @@ class AnalysisWorker:
                     "CAS commit rejected on completion for %s; stale generation or media revision",
                     job.event_id,
                 )
-                await self._job_store.supersede_job(job.id, job.generation, claim_token=job.claim_token)
+                await self._job_store.supersede_job(
+                    job.id, job.generation, claim_token=job.claim_token
+                )
 
         except Exception as err:
             if not self._rec_api.store.is_open:
@@ -670,10 +859,19 @@ class AnalysisWorker:
             error_code = "TIMEOUT"
 
         clean_code = sanitize_error_code(error_code)
-        backoff = BASE_BACKOFF_SECONDS * (2**job.attempts)
+        retry_delay = getattr(err, "retry_delay", None) if isinstance(err, AnalysisError) else None
+
+        if is_retryable_provider_error(err):
+            backoff = compute_retry_delay(job.attempts, retry_delay=retry_delay)
+            cooldown_until = utc_now() + timedelta(seconds=backoff)
+            await self._job_store.extend_provider_cooldown(cooldown_until)
+        else:
+            backoff = min(MAX_BACKOFF_SECONDS, BASE_BACKOFF_SECONDS * (2**job.attempts))
 
         # Check if job is still current in our store
-        if not await self._job_store.is_job_current(job.id, job.generation, claim_token=job.claim_token):
+        if not await self._job_store.is_job_current(
+            job.id, job.generation, claim_token=job.claim_token
+        ):
             _LOGGER.info("Job %s was superseded; ignoring failure handler", job.event_id)
             return
 
@@ -797,9 +995,7 @@ class AnalysisWorker:
         policy: str,
         extraction_timeout: float,
     ) -> list[ExtractedFrame]:
-        available_media = [
-            m for m in getattr(event, "media", []) if getattr(m, "available", True)
-        ]
+        available_media = [m for m in getattr(event, "media", []) if getattr(m, "available", True)]
         if not available_media:
             return []
 
@@ -846,7 +1042,11 @@ class AnalysisWorker:
             source_fp = compute_source_fingerprint(resolved_path, stat_res)
 
             ts_list = [a.offset_seconds for a in item_anchors]
-            quality = getattr(item_anchors[0], "timestamp_quality", "unknown") if item_anchors else "unknown"
+            quality = (
+                getattr(item_anchors[0], "timestamp_quality", "unknown")
+                if item_anchors
+                else "unknown"
+            )
             offset_q = (
                 getattr(item_anchors[0], "offset_quality", "unknown") if item_anchors else "unknown"
             )
@@ -866,13 +1066,17 @@ class AnalysisWorker:
                                     mime_type=c[2],
                                     media_id=m_id,
                                     offset_seconds=c[0],
-                                    timestamp_quality=getattr(anchor_obj, "timestamp_quality", "unknown"),
+                                    timestamp_quality=getattr(
+                                        anchor_obj, "timestamp_quality", "unknown"
+                                    ),
                                     offset_quality=getattr(anchor_obj, "offset_quality", "unknown"),
                                 )
                             )
                         continue
                     elif len(cached_anchors) >= len(item_anchors):
-                        subset = FrameCache.select_compatible_subset(cached_anchors, len(item_anchors))
+                        subset = FrameCache.select_compatible_subset(
+                            cached_anchors, len(item_anchors)
+                        )
                         for anchor_obj, c in zip(item_anchors, subset):
                             accumulated_frames.append(
                                 ExtractedFrame(
@@ -880,7 +1084,9 @@ class AnalysisWorker:
                                     mime_type=c[2],
                                     media_id=m_id,
                                     offset_seconds=c[0],
-                                    timestamp_quality=getattr(anchor_obj, "timestamp_quality", "unknown"),
+                                    timestamp_quality=getattr(
+                                        anchor_obj, "timestamp_quality", "unknown"
+                                    ),
                                     offset_quality=getattr(anchor_obj, "offset_quality", "unknown"),
                                 )
                             )
@@ -927,7 +1133,12 @@ class AnalysisWorker:
                 )
                 await self._handle_fusion_job_failure(
                     job,
-                    AnalysisError("TIMEOUT", "Fusion execution deadline exceeded", retryable=True),
+                    AnalysisError(
+                        "TIMEOUT",
+                        "Fusion execution deadline exceeded",
+                        retryable=True,
+                        timeout_source="job",
+                    ),
                 )
             except asyncio.CancelledError:
                 _LOGGER.info(
@@ -937,7 +1148,9 @@ class AnalysisWorker:
                 raise
             except Exception as err:
                 _LOGGER.error(
-                    "Execution error on fusion job %s: %s", job.incident_id, sanitize_error_code(err)
+                    "Execution error on fusion job %s: %s",
+                    job.incident_id,
+                    sanitize_error_code(err),
                 )
                 await self._handle_fusion_job_failure(job, err)
         finally:
@@ -963,13 +1176,21 @@ class AnalysisWorker:
 
         if self._gemini is None:
             await self._fusion_job_store.fail_fusion_job(
-                job.id, job.generation, "MISSING_API_KEY", retryable=False, claim_token=job.claim_token
+                job.id,
+                job.generation,
+                "MISSING_API_KEY",
+                retryable=False,
+                claim_token=job.claim_token,
             )
             return
 
         if not hasattr(self._rec_api, "get_incident_inputs"):
             await self._fusion_job_store.fail_fusion_job(
-                job.id, job.generation, "INCIDENT_API_UNAVAILABLE", retryable=False, claim_token=job.claim_token
+                job.id,
+                job.generation,
+                "INCIDENT_API_UNAVAILABLE",
+                retryable=False,
+                claim_token=job.claim_token,
             )
             return
 
@@ -1030,15 +1251,29 @@ class AnalysisWorker:
             available_events = [
                 ev
                 for ev in events
-                if (
-                    getattr(ev, "annotations", {}).get(ANNOTATION_NAMESPACE, {}) or {}
-                ).get("status")
+                if (getattr(ev, "annotations", {}).get(ANNOTATION_NAMESPACE, {}) or {}).get(
+                    "status"
+                )
                 == STATUS_COMPLETE
                 and getattr(ev, "media", None)
                 and any(getattr(m, "available", True) for m in ev.media)
             ]
 
             ann_gen = job.annotation_generation or 1
+            renewed = await self._rec_api.renew_incident_annotation_reservation(
+                incident_id=job.incident_id,
+                namespace=ANNOTATION_NAMESPACE,
+                expected_generation=ann_gen,
+                expected_input_token=job.input_token,
+                profile_digest=job.profile_digest,
+                worker_id=self._worker_id,
+                ttl_seconds=derive_reservation_ttl(job_deadline),
+            )
+            if not renewed:
+                await self._fusion_job_store.supersede_fusion_job(
+                    job.id, job.generation, claim_token=job.claim_token
+                )
+                return
 
             # Group available events by unique camera visual view
             views_map: dict[str, list[Any]] = {}
@@ -1113,7 +1348,6 @@ class AnalysisWorker:
                 )
                 return
 
-
         # Pin all member media
         pins: list[Any] = []
         try:
@@ -1150,9 +1384,7 @@ class AnalysisWorker:
                     if frames_needed <= 0:
                         break
                     per_ev_limit = (
-                        max(1, frames_needed // len(ev_list))
-                        if len(ev_list) > 1
-                        else frames_needed
+                        max(1, frames_needed // len(ev_list)) if len(ev_list) > 1 else frames_needed
                     )
                     raw_frames = await self._extract_frames_for_event(
                         event=ev,
@@ -1227,9 +1459,7 @@ class AnalysisWorker:
                 # Observations: aggregate across all relevant selected events for this view
                 obs_parts: list[str] = []
                 for ev in ev_list:
-                    prior_ann = (
-                        getattr(ev, "annotations", {}).get(ANNOTATION_NAMESPACE, {}) or {}
-                    )
+                    prior_ann = getattr(ev, "annotations", {}).get(ANNOTATION_NAMESPACE, {}) or {}
                     prior_summary = prior_ann.get("summary")
                     if prior_summary and isinstance(prior_summary, str) and prior_summary.strip():
                         obs_parts.append(prior_summary.strip())
@@ -1341,6 +1571,7 @@ class AnalysisWorker:
 
         err_code = err.code if isinstance(err, AnalysisError) else sanitize_error_code(err)
         retryable = err.retryable if isinstance(err, AnalysisError) else False
+        retry_delay = getattr(err, "retry_delay", None) if isinstance(err, AnalysisError) else None
 
         job_max_attempts = self._max_attempts
         if job.profile_payload:
@@ -1350,8 +1581,14 @@ class AnalysisWorker:
             except Exception:
                 pass
 
+        if is_retryable_provider_error(err):
+            backoff = compute_retry_delay(job.attempts, retry_delay=retry_delay)
+            cooldown_until = utc_now() + timedelta(seconds=backoff)
+            await self._job_store.extend_provider_cooldown(cooldown_until)
+        else:
+            backoff = min(MAX_BACKOFF_SECONDS, BASE_BACKOFF_SECONDS * (2**job.attempts))
+
         if retryable and (job.attempts + 1) < job_max_attempts:
-            backoff = BASE_BACKOFF_SECONDS * (2**job.attempts)
             await self._fusion_job_store.fail_fusion_job(
                 job.id,
                 job.generation,

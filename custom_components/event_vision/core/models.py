@@ -85,6 +85,7 @@ except ImportError:
             validate_safe_id,
         )
     except ImportError:
+
         class ValidationError(ValueError):  # type: ignore[no-redef]
             pass
 
@@ -112,9 +113,7 @@ except ImportError:
                         return self.default
                     raise ValidationError(f"{self.name} cannot be None")
                 if isinstance(val, bool) or not isinstance(val, (int, float)):
-                    raise ValidationError(
-                        f"{self.name} must be a number, got {type(val).__name__}"
-                    )
+                    raise ValidationError(f"{self.name} must be a number, got {type(val).__name__}")
                 try:
                     num_float = float(val)
                 except OverflowError as err:
@@ -323,36 +322,50 @@ def validate_profile_payload(
     Never silently falls back to arbitrary current settings on invalid payload.
     """
     if not payload_str or not isinstance(payload_str, str):
-        raise AnalysisError("INVALID_PROFILE", "Missing or invalid profile payload string", retryable=False)
+        raise AnalysisError(
+            "INVALID_PROFILE", "Missing or invalid profile payload string", retryable=False
+        )
 
     try:
         data = json.loads(payload_str)
     except Exception as err:
-        raise AnalysisError("INVALID_PROFILE", f"Corrupt profile payload JSON: {err}", retryable=False) from err
+        raise AnalysisError(
+            "INVALID_PROFILE", f"Corrupt profile payload JSON: {err}", retryable=False
+        ) from err
 
     if not isinstance(data, dict):
-        raise AnalysisError("INVALID_PROFILE", "Profile payload must be a JSON object", retryable=False)
+        raise AnalysisError(
+            "INVALID_PROFILE", "Profile payload must be a JSON object", retryable=False
+        )
 
     # 1. Policy version check: must be integer == 1 (non-bool)
     p_ver = data.get("policy_version")
     if isinstance(p_ver, bool) or not isinstance(p_ver, int) or p_ver != PROFILE_POLICY_VERSION:
-        raise AnalysisError("INVALID_PROFILE", f"Unsupported policy_version in snapshot: {p_ver}", retryable=False)
+        raise AnalysisError(
+            "INVALID_PROFILE", f"Unsupported policy_version in snapshot: {p_ver}", retryable=False
+        )
 
     # 2. Semantic fields validation
     model = data.get("model")
     if not isinstance(model, str) or not model.strip():
-        raise AnalysisError("INVALID_PROFILE", "Invalid or missing model in snapshot", retryable=False)
+        raise AnalysisError(
+            "INVALID_PROFILE", "Invalid or missing model in snapshot", retryable=False
+        )
     model = model.strip()
 
     try:
         max_frames = int(SPEC_MAX_FRAMES.validate(data.get("max_frames")))
     except (ValidationError, ValueError, TypeError) as err:
-        raise AnalysisError("INVALID_PROFILE", f"Invalid max_frames in snapshot: {err}", retryable=False) from err
+        raise AnalysisError(
+            "INVALID_PROFILE", f"Invalid max_frames in snapshot: {err}", retryable=False
+        ) from err
 
     sampling_policy = data.get("sampling_policy")
     if not isinstance(sampling_policy, str) or sampling_policy not in VALID_SAMPLING_POLICIES:
         raise AnalysisError(
-            "INVALID_PROFILE", f"Invalid sampling_policy in snapshot: {sampling_policy}", retryable=False
+            "INVALID_PROFILE",
+            f"Invalid sampling_policy in snapshot: {sampling_policy}",
+            retryable=False,
         )
 
     base_prompt = data.get("base_prompt")
@@ -362,7 +375,9 @@ def validate_profile_payload(
 
     instructions = data.get("instructions")
     if instructions is not None and not isinstance(instructions, str):
-        raise AnalysisError("INVALID_PROFILE", "instructions must be a string or None", retryable=False)
+        raise AnalysisError(
+            "INVALID_PROFILE", "instructions must be a string or None", retryable=False
+        )
     instructions_str = instructions.strip() if instructions else ""
 
     # Reconstruct canonical semantic dictionary
@@ -402,7 +417,9 @@ def validate_profile_payload(
             max_attempts=b_attempts,
         )
         if not ok:
-            raise AnalysisError("INVALID_PROFILE", f"Invalid budget bounds in snapshot: {err}", retryable=False)
+            raise AnalysisError(
+                "INVALID_PROFILE", f"Invalid budget bounds in snapshot: {err}", retryable=False
+            )
 
         budget_dict = {
             "job_deadline": float(b_deadline),
@@ -426,12 +443,16 @@ def validate_profile_payload(
     return semantic_dict, budget_dict
 
 
-def derive_reservation_ttl(job_deadline: float, cas_margin: float = CAS_CLEANUP_MARGIN_SECONDS) -> float:
+def derive_reservation_ttl(
+    job_deadline: float, cas_margin: float = CAS_CLEANUP_MARGIN_SECONDS
+) -> float:
     """Derive annotation reservation TTL ensuring job execution + CAS margin fits."""
     return float(job_deadline + cas_margin)
 
 
-def derive_lease_pin_seconds(job_deadline: float, cas_margin: float = CAS_CLEANUP_MARGIN_SECONDS) -> float:
+def derive_lease_pin_seconds(
+    job_deadline: float, cas_margin: float = CAS_CLEANUP_MARGIN_SECONDS
+) -> float:
     """Derive media lease pin duration guaranteeing retention does not delete media during execution."""
     return max(300.0, float(job_deadline + cas_margin + 60.0))
 
@@ -644,10 +665,20 @@ def sanitize_error_code(err: Any) -> str:
 class AnalysisError(Exception):
     """Base exception for analysis errors."""
 
-    def __init__(self, code: str, message: str, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        retryable: bool = False,
+        retry_delay: float | None = None,
+        *,
+        timeout_source: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.retryable = retryable
+        self.retry_delay = retry_delay
+        self.timeout_source = timeout_source
 
 
 class GeminiKeyError(AnalysisError):
@@ -665,6 +696,180 @@ class FrameExtractionError(AnalysisError):
 # -----------------------------------------------------------------------------
 # Result and Annotation Data Structures
 # -----------------------------------------------------------------------------
+
+
+def _validate_coverage_int(val: Any, name: str) -> int:
+    """Validate that a coverage count is a genuine non-boolean, non-negative bounded integer."""
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise ValueError(f"{name} must be an integer, got {type(val).__name__}")
+    if val < 0 or val > 10000:
+        raise ValueError(f"{name} must be between 0 and 10000, got {val}")
+    return val
+
+
+@dataclass(frozen=True)
+class ObservationCoverage:
+    """Structured observation coverage metadata for completed event analyses.
+
+    Explicitly records bounded sampling plan fulfillment ('complete' means all planned
+    frames and planned clips in the bounded sampling plan were extracted; 'partial' means
+    some planned frames or clips failed extraction). Never equates sampling-plan fulfillment
+    to exhaustive event or continuous-video capture completeness; unselected_clips records
+    available clips deliberately excluded by the frame budget.
+    """
+
+    planned_frames: int
+    extracted_frames: int
+    planned_clips: int
+    sampled_clips: int
+    missing_clips: int
+    observation_state: str  # "complete" | "partial" (sampling plan fulfillment)
+    is_partial: bool | None = None
+    available_clips: int | None = None
+    unselected_clips: int | None = None
+    source_capture_state: str | None = None
+    source_time_uncertainty_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        _validate_coverage_int(self.planned_frames, "planned_frames")
+        _validate_coverage_int(self.extracted_frames, "extracted_frames")
+        _validate_coverage_int(self.planned_clips, "planned_clips")
+        _validate_coverage_int(self.sampled_clips, "sampled_clips")
+        _validate_coverage_int(self.missing_clips, "missing_clips")
+
+        if self.extracted_frames > self.planned_frames:
+            raise ValueError("extracted_frames cannot exceed planned_frames")
+        if self.sampled_clips > self.planned_clips:
+            raise ValueError("sampled_clips cannot exceed planned_clips")
+        if self.missing_clips != (self.planned_clips - self.sampled_clips):
+            raise ValueError("missing_clips must equal planned_clips - sampled_clips")
+
+        if self.available_clips is None and self.unselected_clips is None:
+            object.__setattr__(self, "available_clips", self.planned_clips)
+            object.__setattr__(self, "unselected_clips", 0)
+        elif self.available_clips is not None and self.unselected_clips is None:
+            _validate_coverage_int(self.available_clips, "available_clips")
+            if self.available_clips < self.planned_clips:
+                raise ValueError("available_clips cannot be less than planned_clips")
+            object.__setattr__(self, "unselected_clips", self.available_clips - self.planned_clips)
+        elif self.available_clips is None and self.unselected_clips is not None:
+            _validate_coverage_int(self.unselected_clips, "unselected_clips")
+            derived_available = self.planned_clips + self.unselected_clips
+            _validate_coverage_int(derived_available, "available_clips")
+            object.__setattr__(self, "available_clips", derived_available)
+        else:
+            assert self.available_clips is not None and self.unselected_clips is not None
+            _validate_coverage_int(self.available_clips, "available_clips")
+            _validate_coverage_int(self.unselected_clips, "unselected_clips")
+            if self.available_clips < self.planned_clips:
+                raise ValueError("available_clips cannot be less than planned_clips")
+            if self.unselected_clips != (self.available_clips - self.planned_clips):
+                raise ValueError("unselected_clips must equal available_clips - planned_clips")
+
+        if not isinstance(self.observation_state, str) or self.observation_state not in (
+            "complete",
+            "partial",
+        ):
+            raise ValueError(f"Invalid observation_state: {self.observation_state}")
+
+        if self.observation_state == "complete" and (
+            self.extracted_frames < self.planned_frames or self.missing_clips > 0
+        ):
+            raise ValueError(
+                "observation_state cannot be 'complete' when planned frames or clips are missing"
+            )
+
+        expected_partial = self.observation_state == "partial"
+        if self.is_partial is None:
+            object.__setattr__(self, "is_partial", expected_partial)
+        else:
+            if not isinstance(self.is_partial, bool):
+                raise ValueError("is_partial must be a boolean")
+            if self.is_partial != expected_partial:
+                raise ValueError(
+                    f"is_partial ({self.is_partial}) is inconsistent with observation_state ('{self.observation_state}')"
+                )
+
+        if self.source_capture_state is not None:
+            if not isinstance(self.source_capture_state, str):
+                raise ValueError("source_capture_state must be a string")
+            clean_cs = self.source_capture_state.strip()
+            if (
+                not clean_cs
+                or len(clean_cs) > 64
+                or any(c in clean_cs for c in ("/", "\\", ":"))
+                or not re.match(r"^[a-zA-Z0-9_-]+$", clean_cs)
+            ):
+                raise ValueError("Invalid source_capture_state")
+            object.__setattr__(self, "source_capture_state", clean_cs)
+
+        if self.source_time_uncertainty_seconds is not None:
+            if isinstance(self.source_time_uncertainty_seconds, bool) or not isinstance(
+                self.source_time_uncertainty_seconds, (int, float)
+            ):
+                raise ValueError(
+                    "source_time_uncertainty_seconds must be a finite non-negative number"
+                )
+            u_val = float(self.source_time_uncertainty_seconds)
+            if math.isnan(u_val) or not math.isfinite(u_val) or u_val < 0.0 or u_val > 86400.0:
+                raise ValueError(
+                    "source_time_uncertainty_seconds must be a finite non-negative number <= 86400"
+                )
+            object.__setattr__(self, "source_time_uncertainty_seconds", u_val)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to strict dictionary with bounded types."""
+        d: dict[str, Any] = {
+            "available_clips": int(
+                self.available_clips if self.available_clips is not None else self.planned_clips
+            ),
+            "planned_frames": int(self.planned_frames),
+            "extracted_frames": int(self.extracted_frames),
+            "planned_clips": int(self.planned_clips),
+            "sampled_clips": int(self.sampled_clips),
+            "missing_clips": int(self.missing_clips),
+            "unselected_clips": int(
+                self.unselected_clips if self.unselected_clips is not None else 0
+            ),
+            "observation_state": self.observation_state,
+            "is_partial": bool(self.is_partial),
+        }
+        if self.source_capture_state is not None:
+            d["source_capture_state"] = self.source_capture_state
+        if self.source_time_uncertainty_seconds is not None:
+            d["source_time_uncertainty_seconds"] = float(self.source_time_uncertainty_seconds)
+        return d
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ObservationCoverage:
+        """Construct and strictly validate from dictionary."""
+        if not isinstance(data, dict):
+            raise ValueError("coverage data must be a dictionary")
+        required_keys = (
+            "planned_frames",
+            "extracted_frames",
+            "planned_clips",
+            "sampled_clips",
+            "missing_clips",
+            "observation_state",
+        )
+        for k in required_keys:
+            if k not in data:
+                raise ValueError(f"Missing required coverage field: {k}")
+
+        return cls(
+            planned_frames=data["planned_frames"],
+            extracted_frames=data["extracted_frames"],
+            planned_clips=data["planned_clips"],
+            sampled_clips=data["sampled_clips"],
+            missing_clips=data["missing_clips"],
+            observation_state=data["observation_state"],
+            is_partial=data.get("is_partial"),
+            available_clips=data.get("available_clips"),
+            unselected_clips=data.get("unselected_clips"),
+            source_capture_state=data.get("source_capture_state"),
+            source_time_uncertainty_seconds=data.get("source_time_uncertainty_seconds"),
+        )
 
 
 @dataclass(frozen=True)
@@ -701,7 +906,8 @@ class AnalysisAnnotation:
       "model"?: str,
       "model_version"?: str,
       "updated_at"?: str (ISO-8601),
-      "frames"?: list[dict[str, Any]]
+      "frames"?: list[dict[str, Any]],
+      "coverage"?: dict[str, Any]
     }
     """
 
@@ -716,14 +922,28 @@ class AnalysisAnnotation:
     model_version: str | None = None
     updated_at: str | None = None
     frames: list[dict[str, Any]] | None = None
+    coverage: ObservationCoverage | dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.status not in VALID_STATUSES:
             raise ValueError(f"Invalid status: {self.status}")
-        if not isinstance(self.media_revision, int) or self.media_revision < 1:
+        if (
+            isinstance(self.media_revision, bool)
+            or not isinstance(self.media_revision, int)
+            or self.media_revision < 1
+        ):
             raise ValueError("media_revision must be positive integer")
-        if not isinstance(self.generation, int) or self.generation < 1:
+        if (
+            isinstance(self.generation, bool)
+            or not isinstance(self.generation, int)
+            or self.generation < 1
+        ):
             raise ValueError("generation must be positive integer")
+        if self.coverage is not None:
+            if isinstance(self.coverage, dict):
+                object.__setattr__(self, "coverage", ObservationCoverage.from_dict(self.coverage))
+            elif not isinstance(self.coverage, ObservationCoverage):
+                raise ValueError("coverage must be an ObservationCoverage instance or valid dict")
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to strict wire dictionary with non-None optional fields."""
@@ -748,11 +968,24 @@ class AnalysisAnnotation:
             payload["updated_at"] = self.updated_at
         if self.frames is not None:
             payload["frames"] = self.frames
+        if self.coverage is not None:
+            assert isinstance(self.coverage, ObservationCoverage)
+            payload["coverage"] = self.coverage.to_dict()
         return payload
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AnalysisAnnotation:
         """Construct from raw dictionary."""
+        raw_cov = data.get("coverage")
+        cov_obj: ObservationCoverage | None = None
+        if raw_cov is not None:
+            if isinstance(raw_cov, ObservationCoverage):
+                cov_obj = raw_cov
+            elif isinstance(raw_cov, dict):
+                cov_obj = ObservationCoverage.from_dict(raw_cov)
+            else:
+                raise ValueError("Invalid coverage field in annotation")
+
         return cls(
             status=data["status"],
             media_revision=data["media_revision"],
@@ -765,6 +998,7 @@ class AnalysisAnnotation:
             model_version=data.get("model_version"),
             updated_at=data.get("updated_at"),
             frames=data.get("frames"),
+            coverage=cov_obj,
         )
 
 
@@ -928,7 +1162,7 @@ class FusionAnnotation:
             "profile_digest": self.profile_digest,
         }
         if self.narrative is not None:
-            d["narrative"] = self.narrative[:MAX_SUMMARY_LEN * 2]
+            d["narrative"] = self.narrative[: MAX_SUMMARY_LEN * 2]
         if self.activity is not None:
             d["activity"] = self.activity
         if self.possible_cross_view_matches is not None:
@@ -968,9 +1202,6 @@ class FusionAnnotation:
             member_events=data.get("member_events"),
             view_frames=data.get("view_frames"),
         )
-
-
-
 
 
 def compute_fusion_profile_digest(
@@ -1029,15 +1260,21 @@ def validate_fusion_profile_payload(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Validate snapshot against strict bounds and verify profile digest consistency."""
     if not payload_str or not isinstance(payload_str, str):
-        raise AnalysisError("INVALID_PROFILE", "Missing or non-string fusion payload", retryable=False)
+        raise AnalysisError(
+            "INVALID_PROFILE", "Missing or non-string fusion payload", retryable=False
+        )
 
     try:
         data = json.loads(payload_str)
     except Exception as err:
-        raise AnalysisError("INVALID_PROFILE", f"Malformed fusion profile JSON: {err}", retryable=False) from err
+        raise AnalysisError(
+            "INVALID_PROFILE", f"Malformed fusion profile JSON: {err}", retryable=False
+        ) from err
 
     if not isinstance(data, dict):
-        raise AnalysisError("INVALID_PROFILE", "Fusion profile payload must be a JSON object", retryable=False)
+        raise AnalysisError(
+            "INVALID_PROFILE", "Fusion profile payload must be a JSON object", retryable=False
+        )
 
     model_raw = data.get("model", "")
     if not isinstance(model_raw, str):
@@ -1047,16 +1284,24 @@ def validate_fusion_profile_payload(
         raise AnalysisError("INVALID_PROFILE", f"Invalid model name: '{model}'", retryable=False)
 
     try:
-        max_frames = int(SPEC_FUSION_MAX_FRAMES.validate(data.get("max_frames", DEFAULT_FUSION_MAX_FRAMES)))
+        max_frames = int(
+            SPEC_FUSION_MAX_FRAMES.validate(data.get("max_frames", DEFAULT_FUSION_MAX_FRAMES))
+        )
     except (ValidationError, ValueError, TypeError) as err:
-        raise AnalysisError("INVALID_PROFILE", f"Invalid max_frames: {err}", retryable=False) from err
+        raise AnalysisError(
+            "INVALID_PROFILE", f"Invalid max_frames: {err}", retryable=False
+        ) from err
 
     sampling_policy_raw = data.get("sampling_policy", DEFAULT_SAMPLING_POLICY)
     if not isinstance(sampling_policy_raw, str):
-        raise AnalysisError("INVALID_PROFILE", f"Invalid sampling_policy: {sampling_policy_raw}", retryable=False)
+        raise AnalysisError(
+            "INVALID_PROFILE", f"Invalid sampling_policy: {sampling_policy_raw}", retryable=False
+        )
     sampling_policy = sampling_policy_raw.strip()
     if sampling_policy not in VALID_SAMPLING_POLICIES:
-        raise AnalysisError("INVALID_PROFILE", f"Invalid sampling_policy: {sampling_policy}", retryable=False)
+        raise AnalysisError(
+            "INVALID_PROFILE", f"Invalid sampling_policy: {sampling_policy}", retryable=False
+        )
 
     policy_version = data.get("policy_version", PROFILE_POLICY_VERSION)
     if (
@@ -1064,11 +1309,15 @@ def validate_fusion_profile_payload(
         or not isinstance(policy_version, int)
         or policy_version != PROFILE_POLICY_VERSION
     ):
-        raise AnalysisError("INVALID_PROFILE", f"Unsupported policy_version: {policy_version}", retryable=False)
+        raise AnalysisError(
+            "INVALID_PROFILE", f"Unsupported policy_version: {policy_version}", retryable=False
+        )
     fusion_prompt_raw = data.get("fusion_prompt", DEFAULT_FUSION_PROMPT)
     instructions_raw = data.get("instructions", "")
     if not isinstance(fusion_prompt_raw, str) or not isinstance(instructions_raw, str):
-        raise AnalysisError("INVALID_PROFILE", "Fusion prompt and instructions must be strings", retryable=False)
+        raise AnalysisError(
+            "INVALID_PROFILE", "Fusion prompt and instructions must be strings", retryable=False
+        )
     fusion_prompt = fusion_prompt_raw.strip()
     instructions = instructions_raw.strip()
 
@@ -1082,7 +1331,9 @@ def validate_fusion_profile_payload(
     }
 
     if expected_digest:
-        raw_canonical = json.dumps(semantic_dict, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        raw_canonical = json.dumps(semantic_dict, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
         computed_digest = hashlib.sha256(raw_canonical).hexdigest()[:16]
         if computed_digest != expected_digest:
             raise AnalysisError(
@@ -1093,7 +1344,9 @@ def validate_fusion_profile_payload(
 
     budget_raw = data.get("budget", {})
     if not isinstance(budget_raw, dict):
-        raise AnalysisError("INVALID_PROFILE", "budget field must be a JSON object", retryable=False)
+        raise AnalysisError(
+            "INVALID_PROFILE", "budget field must be a JSON object", retryable=False
+        )
 
     job_deadline_raw = budget_raw.get("job_deadline", DEFAULT_FUSION_JOB_DEADLINE)
     provider_timeout_raw = budget_raw.get("provider_timeout", DEFAULT_PROVIDER_TIMEOUT)
@@ -1107,7 +1360,9 @@ def validate_fusion_profile_payload(
         max_attempts=max_attempts_raw,
     )
     if not valid_budget:
-        raise AnalysisError("INVALID_PROFILE", f"Invalid fusion budget in snapshot: {budget_error}", retryable=False)
+        raise AnalysisError(
+            "INVALID_PROFILE", f"Invalid fusion budget in snapshot: {budget_error}", retryable=False
+        )
     job_deadline = float(job_deadline_raw)
     provider_timeout = float(provider_timeout_raw)
     extraction_timeout = float(extraction_timeout_raw)

@@ -12,13 +12,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import secrets
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ from ..const import (
 )
 from .models import (
     derive_queue_lease_seconds,
+    ensure_utc,
     format_iso,
     sanitize_error_code,
     utc_now,
@@ -124,7 +126,9 @@ class DurableQueueEngine:
             self._spec = spec
         else:
             if not table_name or not target_column or not revision_column:
-                raise ValueError("Must provide either QueueSpec or table_name, target_column, and revision_column")
+                raise ValueError(
+                    "Must provide either QueueSpec or table_name, target_column, and revision_column"
+                )
             order_by = (
                 "is_manual DESC, attempts ASC, id ASC"
                 if recover_on_lease
@@ -252,6 +256,16 @@ class DurableQueueEngine:
                     ON {self._spec.table_name} ({idx_cols_str});
                     """
                 )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS provider_cooldown (
+                    id TEXT PRIMARY KEY,
+                    cooldown_until TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
 
             self._conn.commit()
             self._is_open = True
@@ -398,7 +412,10 @@ class DurableQueueEngine:
                             """,
                             (new_gen, profile_payload, new_ann_gen, now_str, existing["id"]),
                         )
-                        cur.execute(f"SELECT * FROM {self._spec.table_name} WHERE id = ?;", (existing["id"],))
+                        cur.execute(
+                            f"SELECT * FROM {self._spec.table_name} WHERE id = ?;",
+                            (existing["id"],),
+                        )
                         row = cur.fetchone()
                         cur.execute("COMMIT;")
                         return row, True
@@ -430,7 +447,10 @@ class DurableQueueEngine:
                             """,
                             (now_str, now_str, existing["id"]),
                         )
-                        cur.execute(f"SELECT * FROM {self._spec.table_name} WHERE id = ?;", (existing["id"],))
+                        cur.execute(
+                            f"SELECT * FROM {self._spec.table_name} WHERE id = ?;",
+                            (existing["id"],),
+                        )
                         row = cur.fetchone()
                         cur.execute("COMMIT;")
                         return row, True
@@ -453,7 +473,10 @@ class DurableQueueEngine:
                             """,
                             (new_gen, profile_payload, new_ann_gen, now_str, existing["id"]),
                         )
-                        cur.execute(f"SELECT * FROM {self._spec.table_name} WHERE id = ?;", (existing["id"],))
+                        cur.execute(
+                            f"SELECT * FROM {self._spec.table_name} WHERE id = ?;",
+                            (existing["id"],),
+                        )
                         row = cur.fetchone()
                         cur.execute("COMMIT;")
                         return row, True
@@ -581,7 +604,9 @@ class DurableQueueEngine:
 
                 # Check max attempts ceiling before granting lease
                 payload = job.get("profile_payload")
-                effective_max_attempts = extract_payload_max_attempts(payload, self._default_max_attempts)
+                effective_max_attempts = extract_payload_max_attempts(
+                    payload, self._default_max_attempts
+                )
                 if job["attempts"] >= effective_max_attempts:
                     cur.execute(
                         f"""
@@ -755,7 +780,9 @@ class DurableQueueEngine:
                     return False
 
                 payload = job.get("profile_payload")
-                effective_max_attempts = extract_payload_max_attempts(payload, self._default_max_attempts)
+                effective_max_attempts = extract_payload_max_attempts(
+                    payload, self._default_max_attempts
+                )
                 new_attempts = job["attempts"] + 1
 
                 if not retryable or new_attempts >= effective_max_attempts:
@@ -794,7 +821,15 @@ class DurableQueueEngine:
                                 claim_token = NULL, next_attempt_at = ?, updated_at = ?
                             WHERE id = ? AND generation = ? AND claim_token = ? AND status = 'leased';
                             """,
-                            (new_attempts, error_code, next_attempt_str, now_str, job_id, generation, token),
+                            (
+                                new_attempts,
+                                error_code,
+                                next_attempt_str,
+                                now_str,
+                                job_id,
+                                generation,
+                                token,
+                            ),
                         )
                     else:
                         cur.execute(
@@ -804,7 +839,14 @@ class DurableQueueEngine:
                                 claim_token = NULL, next_attempt_at = ?, updated_at = ?
                             WHERE id = ? AND generation = ? AND status = 'leased';
                             """,
-                            (new_attempts, error_code, next_attempt_str, now_str, job_id, generation),
+                            (
+                                new_attempts,
+                                error_code,
+                                next_attempt_str,
+                                now_str,
+                                job_id,
+                                generation,
+                            ),
                         )
 
                 success = cur.rowcount > 0
@@ -1366,3 +1408,99 @@ class DurableQueueEngine:
             )
             self._conn.commit()
             return cur.rowcount > 0
+
+    async def get_cooldown(self, key: str = "default") -> datetime | None:
+        """Get persisted cooldown until datetime for key off event loop."""
+        return await asyncio.to_thread(self._sync_get_cooldown, key)
+
+    def _sync_get_cooldown(self, key: str = "default") -> datetime | None:
+        with self._lock:
+            if not self._conn:
+                return None
+            cur = self._conn.cursor()
+            cur.execute(
+                "SELECT cooldown_until FROM provider_cooldown WHERE id = ?;",
+                (key,),
+            )
+            row = cur.fetchone()
+            if row and row.get("cooldown_until"):
+                return ensure_utc(row["cooldown_until"])
+            return None
+
+    async def extend_cooldown(
+        self, until_or_delay: datetime | str | float | int, key: str = "default"
+    ) -> datetime:
+        """Extend cooldown to max(existing, new_until), never shortening concurrent cooldown."""
+        return await asyncio.to_thread(self._sync_extend_cooldown, until_or_delay, key)
+
+    def _sync_extend_cooldown(
+        self, until_or_delay: datetime | str | float | int, key: str = "default"
+    ) -> datetime:
+        now_dt = utc_now()
+        now_str = format_iso(now_dt) or ""
+
+        if isinstance(until_or_delay, (int, float)):
+            if not math.isfinite(until_or_delay) or math.isnan(until_or_delay):
+                raise ValueError("Cooldown delay must be a finite number")
+            delay = max(0.0, min(float(until_or_delay), MAX_BACKOFF_SECONDS))
+            new_until = now_dt + timedelta(seconds=delay)
+        else:
+            new_until = ensure_utc(until_or_delay)
+            max_dt = now_dt + timedelta(seconds=MAX_BACKOFF_SECONDS)
+            if new_until > max_dt:
+                new_until = max_dt
+
+        with self._lock:
+            assert self._conn is not None
+            cur = self._conn.cursor()
+            cur.execute("PRAGMA synchronous = FULL;")
+            cur.execute("BEGIN IMMEDIATE;")
+            try:
+                cur.execute(
+                    "SELECT cooldown_until FROM provider_cooldown WHERE id = ?;",
+                    (key,),
+                )
+                row = cur.fetchone()
+                if row and row.get("cooldown_until"):
+                    existing_until = ensure_utc(row["cooldown_until"])
+                    effective_until = max(existing_until, new_until)
+                    if effective_until > existing_until:
+                        cur.execute(
+                            "UPDATE provider_cooldown SET cooldown_until = ?, updated_at = ? WHERE id = ?;",
+                            (format_iso(effective_until), now_str, key),
+                        )
+                else:
+                    effective_until = new_until
+                    cur.execute(
+                        "INSERT INTO provider_cooldown (id, cooldown_until, updated_at) VALUES (?, ?, ?);",
+                        (key, format_iso(effective_until), now_str),
+                    )
+                cur.execute("COMMIT;")
+                return effective_until
+            except Exception as err:
+                try:
+                    cur.execute("ROLLBACK;")
+                except Exception:
+                    pass
+                raise err
+
+    async def clear_cooldown(self, key: str = "default") -> None:
+        """Clear provider cooldown off event loop."""
+        await asyncio.to_thread(self._sync_clear_cooldown, key)
+
+    def _sync_clear_cooldown(self, key: str = "default") -> None:
+        with self._lock:
+            if not self._conn:
+                return
+            cur = self._conn.cursor()
+            cur.execute("PRAGMA synchronous = FULL;")
+            cur.execute("BEGIN IMMEDIATE;")
+            try:
+                cur.execute("DELETE FROM provider_cooldown WHERE id = ?;", (key,))
+                cur.execute("COMMIT;")
+            except Exception:
+                try:
+                    cur.execute("ROLLBACK;")
+                except Exception:
+                    pass
+                raise
