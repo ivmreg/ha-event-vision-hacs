@@ -5,7 +5,9 @@ Optional generic AI analyzer for event_recording.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from contextlib import AsyncExitStack
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -112,22 +114,58 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     api_key = str(config_data.get(CONF_GEMINI_API_KEY, "")).strip()
     model = str(config_data.get(CONF_MODEL, DEFAULT_MODEL)).strip() or DEFAULT_MODEL
     raw_auto_analyze = bool(config_data.get(CONF_AUTO_ANALYZE, DEFAULT_AUTO_ANALYZE))
-    prompt_instructions = str(config_data.get(CONF_PROMPT_INSTRUCTIONS, DEFAULT_PROMPT_INSTRUCTIONS)).strip()
+    prompt_instructions = str(
+        config_data.get(CONF_PROMPT_INSTRUCTIONS, DEFAULT_PROMPT_INSTRUCTIONS)
+    ).strip()
     if len(prompt_instructions) > MAX_PROMPT_INSTRUCTIONS_LEN:
-        raise ConfigEntryNotReady(f"Prompt instructions length exceeds {MAX_PROMPT_INSTRUCTIONS_LEN} characters")
+        raise ConfigEntryNotReady(
+            f"Prompt instructions length exceeds {MAX_PROMPT_INSTRUCTIONS_LEN} characters"
+        )
 
     # Validate configuration parameters against declarative NumberSpec definitions
     try:
-        concurrency = int(SPEC_CONCURRENCY.validate(config_data.get(CONF_CONCURRENCY, DEFAULT_CONCURRENCY)))
-        max_frames = int(SPEC_MAX_FRAMES.validate(config_data.get(CONF_MAX_FRAMES, DEFAULT_MAX_FRAMES)))
-        job_deadline = float(SPEC_JOB_DEADLINE.validate(config_data.get(CONF_JOB_DEADLINE, DEFAULT_JOB_DEADLINE)))
-        provider_timeout = float(SPEC_PROVIDER_TIMEOUT.validate(config_data.get(CONF_PROVIDER_TIMEOUT, DEFAULT_PROVIDER_TIMEOUT)))
-        extraction_timeout = float(SPEC_EXTRACTION_TIMEOUT.validate(config_data.get(CONF_EXTRACTION_TIMEOUT, DEFAULT_EXTRACTION_TIMEOUT)))
-        max_attempts = int(SPEC_MAX_ATTEMPTS.validate(config_data.get(CONF_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS)))
-        fusion_max_frames = int(SPEC_FUSION_MAX_FRAMES.validate(config_data.get(CONF_FUSION_MAX_FRAMES, DEFAULT_FUSION_MAX_FRAMES)))
-        fusion_job_deadline = float(SPEC_FUSION_JOB_DEADLINE.validate(config_data.get(CONF_FUSION_JOB_DEADLINE, DEFAULT_FUSION_JOB_DEADLINE)))
-        cache_mb = int(SPEC_FRAME_CACHE_MB.validate(config_data.get(CONF_FRAME_CACHE_MB, DEFAULT_FRAME_CACHE_MB)))
-        cache_ttl = float(SPEC_FRAME_CACHE_TTL.validate(config_data.get(CONF_FRAME_CACHE_TTL, DEFAULT_FRAME_CACHE_TTL)))
+        concurrency = int(
+            SPEC_CONCURRENCY.validate(config_data.get(CONF_CONCURRENCY, DEFAULT_CONCURRENCY))
+        )
+        max_frames = int(
+            SPEC_MAX_FRAMES.validate(config_data.get(CONF_MAX_FRAMES, DEFAULT_MAX_FRAMES))
+        )
+        job_deadline = float(
+            SPEC_JOB_DEADLINE.validate(config_data.get(CONF_JOB_DEADLINE, DEFAULT_JOB_DEADLINE))
+        )
+        provider_timeout = float(
+            SPEC_PROVIDER_TIMEOUT.validate(
+                config_data.get(CONF_PROVIDER_TIMEOUT, DEFAULT_PROVIDER_TIMEOUT)
+            )
+        )
+        extraction_timeout = float(
+            SPEC_EXTRACTION_TIMEOUT.validate(
+                config_data.get(CONF_EXTRACTION_TIMEOUT, DEFAULT_EXTRACTION_TIMEOUT)
+            )
+        )
+        max_attempts = int(
+            SPEC_MAX_ATTEMPTS.validate(config_data.get(CONF_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS))
+        )
+        fusion_max_frames = int(
+            SPEC_FUSION_MAX_FRAMES.validate(
+                config_data.get(CONF_FUSION_MAX_FRAMES, DEFAULT_FUSION_MAX_FRAMES)
+            )
+        )
+        fusion_job_deadline = float(
+            SPEC_FUSION_JOB_DEADLINE.validate(
+                config_data.get(CONF_FUSION_JOB_DEADLINE, DEFAULT_FUSION_JOB_DEADLINE)
+            )
+        )
+        cache_mb = int(
+            SPEC_FRAME_CACHE_MB.validate(
+                config_data.get(CONF_FRAME_CACHE_MB, DEFAULT_FRAME_CACHE_MB)
+            )
+        )
+        cache_ttl = float(
+            SPEC_FRAME_CACHE_TTL.validate(
+                config_data.get(CONF_FRAME_CACHE_TTL, DEFAULT_FRAME_CACHE_TTL)
+            )
+        )
     except (ValidationError, ValueError, TypeError) as err:
         raise ConfigEntryNotReady(f"Invalid configuration parameter: {err}") from err
 
@@ -158,7 +196,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         config_data.get(CONF_FUSION_PROMPT_INSTRUCTIONS, DEFAULT_FUSION_PROMPT_INSTRUCTIONS)
     ).strip()
     if len(fusion_instructions) > MAX_FUSION_PROMPT_INSTRUCTIONS_LEN:
-        raise ConfigEntryNotReady(f"Fusion instructions length exceeds {MAX_FUSION_PROMPT_INSTRUCTIONS_LEN} characters")
+        raise ConfigEntryNotReady(
+            f"Fusion instructions length exceeds {MAX_FUSION_PROMPT_INSTRUCTIONS_LEN} characters"
+        )
 
     valid_fusion_budget, fusion_err_msg = validate_fusion_budget_bounds(
         fusion_job_deadline=fusion_job_deadline,
@@ -172,17 +212,36 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Dedicated SQLite persistent job stores
     db_path = Path(hass.config.path(".storage", "event_vision", entry.entry_id, "analysis.db"))
     job_store = AnalysisJobStore(db_path, max_attempts=max_attempts)
-    await job_store.open()
 
-    fusion_db_path = Path(hass.config.path(".storage", "event_vision", entry.entry_id, "fusion_jobs.sqlite"))
-    fusion_job_store = FusionJobStore(fusion_db_path, max_attempts=max_attempts)
-    await fusion_job_store.open()
+    fusion_db_path = Path(
+        hass.config.path(".storage", "event_vision", entry.entry_id, "fusion_jobs.sqlite")
+    )
+    fusion_job_store = (
+        FusionJobStore(fusion_db_path, max_attempts=max_attempts) if enable_fusion else None
+    )
 
     frame_cache = FrameCache(max_bytes=cache_mb * 1024 * 1024, ttl_seconds=cache_ttl)
 
     gemini_client = GeminiClient(api_key=api_key if has_valid_key else "", model=model)
-    frame_extractor = FrameExtractor(ffmpeg_bin=getattr(rec_api, "ffmpeg_binary", None), cache=frame_cache)
+    frame_extractor = FrameExtractor(
+        ffmpeg_bin=getattr(rec_api, "ffmpeg_binary", None), cache=frame_cache
+    )
 
+    analysis_options = dict(
+        model=model,
+        prompt_instructions=prompt_instructions or None,
+        max_frames=max_frames,
+        sampling_policy=sampling_policy,
+        job_deadline=job_deadline,
+        provider_timeout=provider_timeout,
+        extraction_timeout=extraction_timeout,
+        max_attempts=max_attempts,
+        fusion_job_store=fusion_job_store,
+        enable_fusion=enable_fusion,
+        fusion_max_frames=fusion_max_frames,
+        fusion_prompt_instructions=fusion_instructions or None,
+        fusion_job_deadline=fusion_job_deadline,
+    )
     worker = AnalysisWorker(
         job_store=job_store,
         gemini_client=gemini_client,
@@ -190,61 +249,61 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         recording_api=rec_api,
         worker_id=f"worker-{entry.entry_id[:8]}",
         concurrency=concurrency,
-        prompt_instructions=prompt_instructions if prompt_instructions else None,
-        model=model,
-        max_frames=max_frames,
-        sampling_policy=sampling_policy,
-        job_deadline=job_deadline,
-        provider_timeout=provider_timeout,
-        extraction_timeout=extraction_timeout,
-        max_attempts=max_attempts,
-        fusion_job_store=fusion_job_store,
-        enable_fusion=enable_fusion,
-        fusion_max_frames=fusion_max_frames,
-        fusion_prompt_instructions=fusion_instructions if fusion_instructions else None,
-        fusion_job_deadline=fusion_job_deadline,
         cache=frame_cache,
+        **analysis_options,
     )
-
     coordinator = VisionCoordinator(
         job_store=job_store,
         worker=worker,
         recording_api=rec_api,
         auto_analyze=auto_analyze,
-        model=model,
-        prompt_instructions=prompt_instructions if prompt_instructions else None,
-        max_frames=max_frames,
-        sampling_policy=sampling_policy,
-        job_deadline=job_deadline,
-        provider_timeout=provider_timeout,
-        extraction_timeout=extraction_timeout,
-        max_attempts=max_attempts,
-        fusion_job_store=fusion_job_store,
-        enable_fusion=enable_fusion,
-        fusion_max_frames=fusion_max_frames,
-        fusion_prompt_instructions=fusion_instructions if fusion_instructions else None,
-        fusion_job_deadline=fusion_job_deadline,
+        **analysis_options,
     )
 
+    # Register cleanup before the first resource is acquired. AsyncExitStack closes
+    # every owner even if a later cleanup fails, and aclose is idempotent.
+    cleanup = AsyncExitStack()
+    cleanup.push_async_callback(job_store.close)
+    if fusion_job_store:
+        cleanup.push_async_callback(fusion_job_store.close)
+    cleanup.push_async_callback(frame_cache.close)
+    cleanup.push_async_callback(gemini_client.close)
+    cleanup.push_async_callback(coordinator.async_shutdown)
     unsub_periodic = None
+    last_compaction = 0.0
     try:
+        await job_store.open()
+        if fusion_job_store:
+            await fusion_job_store.open()
         # Bind recording API facade and setup subscriptions cleanly through coordinator
         coordinator.bind_recording_api(rec_api, available=has_valid_key)
 
         # Also rebind in manual-only mode after the recording integration reloads.
         async def on_periodic_catchup(_now: Any) -> None:
+            nonlocal last_compaction
             current = _get_recording_api(hass)
-            if current is None or current is not coordinator.rec_api or coordinator._unsub_consumer is None:
+            if (
+                current is None
+                or current is not coordinator.rec_api
+                or coordinator._unsub_consumer is None
+            ):
                 await worker.stop()
                 coordinator.unbind_recording_api()
                 if current is None:
                     return
                 coordinator.bind_recording_api(current, available=True)
                 await job_store.recover_expired_leases(force_all=True)
-                await fusion_job_store.recover_expired_leases(force_all=True)
+                if fusion_job_store:
+                    await fusion_job_store.recover_expired_leases(force_all=True)
                 worker.start()
             if auto_analyze:
                 await coordinator.async_scan_unprocessed_media()
+            now = asyncio.get_running_loop().time()
+            if now - last_compaction >= 3600:
+                await job_store.compact()
+                if fusion_job_store:
+                    await fusion_job_store.compact()
+                last_compaction = now
 
         unsub_periodic = async_track_time_interval(hass, on_periodic_catchup, timedelta(seconds=30))
 
@@ -262,16 +321,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "coordinator": coordinator,
             "frame_cache": frame_cache,
             "unsub_periodic": unsub_periodic,
+            "cleanup": cleanup,
         }
 
         async def on_stop(_event: Any) -> None:
             if unsub_periodic:
                 unsub_periodic()
-            await coordinator.async_shutdown()
-            await gemini_client.close()
-            await job_store.close()
-            await fusion_job_store.close()
-            await frame_cache.clear()
+            await cleanup.aclose()
 
         entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, on_stop))
 
@@ -284,15 +340,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Set up platforms (Sensor)
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    except Exception:
+    except BaseException:
         # Cleanup on partial setup failure
         if unsub_periodic:
             unsub_periodic()
-        await coordinator.async_shutdown()
-        await gemini_client.close()
-        await job_store.close()
-        await fusion_job_store.close()
-        await frame_cache.clear()
+        await cleanup.aclose()
+        hass.data.get(DOMAIN, {}).get("entries", {}).pop(entry.entry_id, None)
         raise
 
     return True
@@ -318,25 +371,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if unsub_periodic:
             unsub_periodic()
 
-        coordinator: VisionCoordinator = entry_data.get("coordinator")
-        if coordinator:
-            await coordinator.async_shutdown()
-
-        job_store: AnalysisJobStore = entry_data.get("job_store")
-        if job_store:
-            await job_store.close()
-
-        fusion_job_store: FusionJobStore = entry_data.get("fusion_job_store")
-        if fusion_job_store:
-            await fusion_job_store.close()
-
-        gemini_client: GeminiClient = entry_data.get("gemini_client")
-        if gemini_client:
-            await gemini_client.close()
-
-        frame_cache: FrameCache = entry_data.get("frame_cache")
-        if frame_cache:
-            await frame_cache.clear()
+        await entry_data["cleanup"].aclose()
 
     entries = hass.data.get(DOMAIN, {}).get("entries", {})
     if not entries:

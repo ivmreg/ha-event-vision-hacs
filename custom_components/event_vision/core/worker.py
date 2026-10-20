@@ -17,7 +17,6 @@ Features:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import math
 import random
@@ -25,6 +24,8 @@ from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 from weakref import WeakValueDictionary
+
+from custom_components.event_recording.contracts import RecordingConsumerAPI
 
 from ..const import (
     ANNOTATION_NAMESPACE,
@@ -50,7 +51,7 @@ from ..const import (
     STATUS_SKIPPED,
     VALID_SAMPLING_POLICIES,
 )
-from .cache import FrameCache, compute_source_fingerprint
+from .cache import FrameCache
 from .extractor import FrameExtractor
 from .fusion_store import FusionJobStore
 from .gemini import GeminiClient
@@ -75,9 +76,8 @@ from .models import (
     format_iso,
     sanitize_error_code,
     utc_now,
-    validate_fusion_profile_payload,
-    validate_profile_payload,
 )
+from .profiles import load_profile
 from .sampling import plan_event_sampling
 from .store import AnalysisJobStore
 
@@ -167,7 +167,7 @@ class AnalysisWorker:
         job_store: AnalysisJobStore,
         gemini_client: GeminiClient | None,
         frame_extractor: FrameExtractor,
-        recording_api: Any,
+        recording_api: RecordingConsumerAPI,
         worker_id: str = "worker-1",
         concurrency: int = 1,
         poll_interval_seconds: float = 3.0,
@@ -222,6 +222,7 @@ class AnalysisWorker:
         self._wake_event = asyncio.Event()
         self._semaphore = asyncio.Semaphore(max(1, min(concurrency, 4)))
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._prefer_fusion = False
         self.event_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self.incident_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
@@ -291,7 +292,7 @@ class AnalysisWorker:
     def max_attempts(self) -> int:
         return self._max_attempts
 
-    def set_recording_api(self, recording_api: Any) -> None:
+    def set_recording_api(self, recording_api: RecordingConsumerAPI) -> None:
         """Update recording API facade instance cleanly."""
         self._rec_api = recording_api
 
@@ -350,7 +351,7 @@ class AnalysisWorker:
 
     async def process_next_job(self) -> bool:
         """Attempt to lease and execute one eligible job with bounded concurrency."""
-        if not self._rec_api.store.is_open:
+        if not self._rec_api.is_open:
             return False
         if self._semaphore.locked():
             return False
@@ -367,35 +368,24 @@ class AnalysisWorker:
 
         permit_acquired = True
         try:
-            lease_sec = derive_queue_lease_seconds(self._job_deadline)
-            job = await self._job_store.lease_job(self._worker_id, lease_seconds=lease_sec)
-            if job:
-                _LOGGER.debug(
-                    "AnalysisWorker leased job %s for event %s (attempt=%d, lease=%.1fs)",
-                    job.id,
-                    job.event_id,
-                    job.attempts,
-                    lease_sec,
-                )
-                task = asyncio.create_task(self._guarded_execute(job))
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
-                return True
-
-            if self._enable_fusion and self._fusion_job_store:
-                flease_sec = derive_queue_lease_seconds(self._fusion_job_deadline)
-                fjob = await self._fusion_job_store.lease_fusion_job(
-                    self._worker_id, lease_seconds=flease_sec
-                )
-                if fjob:
-                    _LOGGER.debug(
-                        "AnalysisWorker leased fusion job %s for incident %s (attempt=%d, lease=%.1fs)",
-                        fjob.id,
-                        fjob.incident_id,
-                        fjob.attempts,
-                        flease_sec,
+            queues = [False, True] if not self._prefer_fusion else [True, False]
+            for fusion in queues:
+                if fusion:
+                    if not self._enable_fusion or not self._fusion_job_store:
+                        continue
+                    job = await self._fusion_job_store.lease_fusion_job(
+                        self._worker_id,
+                        lease_seconds=derive_queue_lease_seconds(self._fusion_job_deadline),
                     )
-                    task = asyncio.create_task(self._guarded_execute_fusion(fjob))
+                else:
+                    job = await self._job_store.lease_job(
+                        self._worker_id,
+                        lease_seconds=derive_queue_lease_seconds(self._job_deadline),
+                    )
+                if job:
+                    self._prefer_fusion = not fusion
+                    execute = self._guarded_execute_fusion if fusion else self._guarded_execute
+                    task = asyncio.create_task(execute(job))
                     self._background_tasks.add(task)
                     task.add_done_callback(self._background_tasks.discard)
                     return True
@@ -409,30 +399,25 @@ class AnalysisWorker:
             raise
 
     async def _guarded_execute(self, job: AnalysisJob) -> None:
-        try:
-            job_deadline = self._job_deadline
-            if job.profile_payload:
-                try:
-                    p_data = json.loads(job.profile_payload)
-                    b_data = p_data.get("budget") if isinstance(p_data, dict) else None
-                    if isinstance(b_data, dict) and "job_deadline" in b_data:
-                        job_deadline = float(b_data["job_deadline"])
-                    elif isinstance(p_data, dict) and "max_frames" in p_data:
-                        m_frames = int(p_data["max_frames"])
-                        derived_dead = (
-                            (m_frames * DEFAULT_EXTRACTION_TIMEOUT)
-                            + DEFAULT_PROVIDER_TIMEOUT
-                            + 10.0
-                        )
-                        job_deadline = max(job_deadline, derived_dead)
-                except Exception:
-                    pass
+        await self._run_claimed(job, fusion=False)
 
+    async def _run_claimed(self, job: AnalysisJob | FusionJob, *, fusion: bool) -> None:
+        """Shared deadline, failure, cancellation, and concurrency ownership."""
+        execute = self._execute_fusion_job if fusion else self._execute_job
+        failure = self._handle_fusion_job_failure if fusion else self._handle_job_failure
+        deadline = self._fusion_job_deadline if fusion else self._job_deadline
+        if job.profile_payload:
             try:
-                await asyncio.wait_for(self._execute_job(job), timeout=job_deadline)
+                deadline = load_profile(
+                    job.profile_payload, job.profile_digest, fusion=fusion
+                ).deadline
+            except AnalysisError:
+                pass  # Execution publishes the invalid-profile failure with its CAS identity.
+        try:
+            try:
+                await asyncio.wait_for(execute(job), timeout=deadline)
             except TimeoutError:
-                _LOGGER.warning("Job %s timed out after %ss deadline", job.event_id, job_deadline)
-                await self._handle_job_failure(
+                await failure(
                     job,
                     AnalysisError(
                         "TIMEOUT",
@@ -442,13 +427,9 @@ class AnalysisWorker:
                     ),
                 )
             except asyncio.CancelledError:
-                _LOGGER.info("Job %s cancelled during execution; leaving recoverable", job.event_id)
-                raise
+                raise  # Durable claims remain recoverable; input cleanup runs inside execute.
             except Exception as err:
-                _LOGGER.error(
-                    "Execution error on job %s: %s", job.event_id, sanitize_error_code(err)
-                )
-                await self._handle_job_failure(job, err)
+                await failure(job, err)
         finally:
             self._semaphore.release()
 
@@ -467,11 +448,8 @@ class AnalysisWorker:
         res_deadline = self._job_deadline
         if job.profile_payload:
             try:
-                p_data = json.loads(job.profile_payload)
-                b_data = p_data.get("budget") if isinstance(p_data, dict) else None
-                if isinstance(b_data, dict) and "job_deadline" in b_data:
-                    res_deadline = float(b_data["job_deadline"])
-            except Exception:
+                res_deadline = load_profile(job.profile_payload, job.profile_digest).deadline
+            except AnalysisError:
                 pass
         res_ttl = derive_reservation_ttl(res_deadline)
 
@@ -497,7 +475,7 @@ class AnalysisWorker:
                         job.id, job.generation, claim_token=job.claim_token
                     )
                     return
-                annotation_gen = await self._rec_api.store.reserve_annotation(
+                annotation_gen = await self._rec_api.reserve_annotation(
                     event_id=job.event_id,
                     namespace=ANNOTATION_NAMESPACE,
                     expected_media_revision=job.media_revision,
@@ -519,7 +497,7 @@ class AnalysisWorker:
                         job.id, job.generation, claim_token=job.claim_token
                     )
                     return
-                renewed = await self._rec_api.store.renew_annotation_reservation(
+                renewed = await self._rec_api.renew_annotation_reservation(
                     event_id=job.event_id,
                     namespace=ANNOTATION_NAMESPACE,
                     expected_media_revision=job.media_revision,
@@ -564,10 +542,8 @@ class AnalysisWorker:
                     retryable=False,
                 )
 
-        semantic_profile, budget = validate_profile_payload(
-            job.profile_payload,
-            expected_digest=job.profile_digest,
-        )
+        profile = load_profile(job.profile_payload, job.profile_digest)
+        semantic_profile, budget = profile.semantic, profile.budget
 
         job_model = semantic_profile["model"]
         job_instructions = semantic_profile["instructions"]
@@ -594,7 +570,7 @@ class AnalysisWorker:
         try:
             # 3. Acquire media lease pin with derived duration bound
             lease_duration = derive_lease_pin_seconds(job_deadline)
-            lease_pin = await self._rec_api.store.pin_media_lease(
+            lease_pin = await self._rec_api.pin_media_lease(
                 event_id=job.event_id,
                 lease_seconds=lease_duration,
                 reason="event_vision analysis",
@@ -620,7 +596,7 @@ class AnalysisWorker:
                     model=job_model,
                     updated_at=format_iso(utc_now()),
                 )
-                if not await self._rec_api.store.set_annotation_cas(
+                if not await self._rec_api.set_annotation_cas(
                     event_id=job.event_id,
                     expected_media_revision=job.media_revision,
                     namespace=ANNOTATION_NAMESPACE,
@@ -657,7 +633,7 @@ class AnalysisWorker:
                     model=self._gemini.model,
                     updated_at=format_iso(utc_now()),
                 )
-                await self._rec_api.store.set_annotation_cas(
+                await self._rec_api.set_annotation_cas(
                     event_id=job.event_id,
                     expected_media_revision=job.media_revision,
                     namespace=ANNOTATION_NAMESPACE,
@@ -698,52 +674,14 @@ class AnalysisWorker:
                 available_clips_count,
             )
 
-            media_by_id = {m.id: m for m in available_media}
-            accumulated_frames: list[ExtractedFrame] = []
-
-            for m_id, item_anchors in anchors_by_media.items():
-                media_item = media_by_id.get(m_id)
-                if not media_item:
-                    continue
-
-                try:
-                    resolved_path = await self._rec_api.resolve_media(job.event_id, m_id)
-                except Exception as err:
-                    _LOGGER.warning(
-                        "Failed to resolve media %s for event %s: %s",
-                        m_id,
-                        job.event_id,
-                        sanitize_error_code(err),
-                    )
-                    continue
-
-                ts_list = [a.offset_seconds for a in item_anchors]
-                quality = item_anchors[0].timestamp_quality if item_anchors else "unknown"
-                offset_q = (
-                    getattr(item_anchors[0], "offset_quality", "exact") if item_anchors else "exact"
-                )
-
-                try:
-                    frames = await self._extractor.extract_from_path(
-                        media_path=resolved_path,
-                        kind=getattr(media_item, "kind", None),
-                        mime_type=getattr(media_item, "mime_type", None),
-                        duration=getattr(media_item, "duration", None),
-                        max_frames=len(ts_list),
-                        timestamps=ts_list,
-                        timeout_seconds=job_extraction_timeout,
-                        media_id=m_id,
-                        timestamp_quality=quality,
-                        offset_quality=offset_q,
-                        media_revision=job.media_revision,
-                    )
-                    if frames:
-                        accumulated_frames.extend(frames)
-                        sampled_media_ids.add(m_id)
-                except Exception as err:
-                    _LOGGER.warning(
-                        "Frame extraction error on media %s: %s", m_id, sanitize_error_code(err)
-                    )
+            accumulated_frames = await self._extract_frames_for_event(
+                event,
+                job_max_frames,
+                job_policy,
+                job_extraction_timeout,
+                planned_anchors=planned_anchors,
+                sampled_media_ids=sampled_media_ids,
+            )
 
             if not accumulated_frames:
                 raise AnalysisError(
@@ -833,7 +771,7 @@ class AnalysisWorker:
                 coverage=coverage_meta,
             )
 
-            committed = await self._rec_api.store.set_annotation_cas(
+            committed = await self._rec_api.set_annotation_cas(
                 event_id=job.event_id,
                 expected_media_revision=job.media_revision,
                 namespace=ANNOTATION_NAMESPACE,
@@ -868,7 +806,7 @@ class AnalysisWorker:
                 )
 
         except Exception as err:
-            if not self._rec_api.store.is_open:
+            if not self._rec_api.is_open:
                 await self._job_store.defer_job(job.id, job.generation, claim_token=job.claim_token)
             else:
                 await self._handle_job_failure(job, err)
@@ -891,7 +829,7 @@ class AnalysisWorker:
         async def _do_release() -> None:
             for token in tokens:
                 try:
-                    await self._rec_api.store.release_media_pin(token)
+                    await self._rec_api.release_media_pin(token)
                 except Exception as err:
                     _LOGGER.warning("Error releasing media pin: %s", sanitize_error_code(err))
 
@@ -961,14 +899,10 @@ class AnalysisWorker:
         )
         if job.profile_payload:
             try:
-                p_data = json.loads(job.profile_payload)
-                if isinstance(p_data, dict):
-                    if p_data.get("model") and isinstance(p_data["model"], str):
-                        job_model = p_data["model"].strip()
-                    b_data = p_data.get("budget")
-                    if isinstance(b_data, dict) and "max_attempts" in b_data:
-                        job_max_attempts = int(b_data["max_attempts"])
-            except Exception:
+                profile = load_profile(job.profile_payload, job.profile_digest)
+                job_model = profile.semantic["model"]
+                job_max_attempts = profile.budget["max_attempts"]
+            except AnalysisError:
                 pass
 
         # If permanent or exhausted attempts, update recording CAS to status='failed'
@@ -1022,7 +956,7 @@ class AnalysisWorker:
                     )
                     posted = False
                     try:
-                        posted = await self._rec_api.store.set_annotation_cas(
+                        posted = await self._rec_api.set_annotation_cas(
                             event_id=job.event_id,
                             expected_media_revision=job.media_revision,
                             namespace=ANNOTATION_NAMESPACE,
@@ -1053,6 +987,10 @@ class AnalysisWorker:
         max_frames: int,
         policy: str,
         extraction_timeout: float,
+        *,
+        planned_anchors: list[Any] | None = None,
+        sampled_media_ids: set[str] | None = None,
+        reuse_compatible: bool = False,
     ) -> list[ExtractedFrame]:
         available_media = [m for m in getattr(event, "media", []) if getattr(m, "available", True)]
         if not available_media:
@@ -1061,12 +999,16 @@ class AnalysisWorker:
         event_rev = getattr(event, "media_revision", 1)
 
         # Plan event sampling across ALL available media items upfront (never chunk 1 alone consuming entire budget)
-        planned_anchors = plan_event_sampling(
-            media_items=available_media,
-            policy=policy,
-            max_frames=max_frames,
-            event_start_at=getattr(event, "start_at", None),
-            source_events=getattr(event, "source_events", ()),
+        planned_anchors = (
+            planned_anchors
+            if planned_anchors is not None
+            else plan_event_sampling(
+                media_items=available_media,
+                policy=policy,
+                max_frames=max_frames,
+                event_start_at=getattr(event, "start_at", None),
+                source_events=getattr(event, "source_events", ()),
+            )
         )
         if not planned_anchors:
             return []
@@ -1097,59 +1039,11 @@ class AnalysisWorker:
                 )
                 continue
 
-            stat_res = await asyncio.to_thread(resolved_path.stat)
-            source_fp = compute_source_fingerprint(resolved_path, stat_res)
-
             ts_list = [a.offset_seconds for a in item_anchors]
-            quality = (
-                getattr(item_anchors[0], "timestamp_quality", "unknown")
-                if item_anchors
-                else "unknown"
-            )
+            quality = item_anchors[0].timestamp_quality if item_anchors else "unknown"
             offset_q = (
                 getattr(item_anchors[0], "offset_quality", "unknown") if item_anchors else "unknown"
             )
-
-            # Warm path: Check if FrameCache contains warm extracted frames matching planned anchors
-            if self._cache and self._cache.enabled:
-                cached_anchors = await self._cache.get_cached_anchors(source_fp, event_rev)
-                if cached_anchors:
-                    cached_seeks = {round(c[0], 2): c for c in cached_anchors}
-                    all_cached = [cached_seeks.get(round(ts, 2)) for ts in ts_list]
-                    if all(c is not None for c in all_cached):
-                        for anchor_obj, c in zip(item_anchors, all_cached):
-                            assert c is not None
-                            accumulated_frames.append(
-                                ExtractedFrame(
-                                    data=c[1],
-                                    mime_type=c[2],
-                                    media_id=m_id,
-                                    offset_seconds=c[0],
-                                    timestamp_quality=getattr(
-                                        anchor_obj, "timestamp_quality", "unknown"
-                                    ),
-                                    offset_quality=getattr(anchor_obj, "offset_quality", "unknown"),
-                                )
-                            )
-                        continue
-                    elif len(cached_anchors) >= len(item_anchors):
-                        subset = FrameCache.select_compatible_subset(
-                            cached_anchors, len(item_anchors)
-                        )
-                        for anchor_obj, c in zip(item_anchors, subset):
-                            accumulated_frames.append(
-                                ExtractedFrame(
-                                    data=c[1],
-                                    mime_type=c[2],
-                                    media_id=m_id,
-                                    offset_seconds=c[0],
-                                    timestamp_quality=getattr(
-                                        anchor_obj, "timestamp_quality", "unknown"
-                                    ),
-                                    offset_quality=getattr(anchor_obj, "offset_quality", "unknown"),
-                                )
-                            )
-                        continue
 
             try:
                 frames = await self._extractor.extract_from_path(
@@ -1164,9 +1058,11 @@ class AnalysisWorker:
                     timestamp_quality=quality,
                     offset_quality=offset_q,
                     media_revision=event_rev,
-                    source_fingerprint=source_fp,
+                    reuse_compatible=reuse_compatible,
                 )
                 accumulated_frames.extend(frames)
+                if frames and sampled_media_ids is not None:
+                    sampled_media_ids.add(m_id)
             except Exception as err:
                 _LOGGER.warning(
                     "Frame extraction error on media %s: %s", m_id, sanitize_error_code(err)
@@ -1175,45 +1071,7 @@ class AnalysisWorker:
         return accumulated_frames[:max_frames]
 
     async def _guarded_execute_fusion(self, job: FusionJob) -> None:
-        try:
-            job_deadline = self._fusion_job_deadline
-            if job.profile_payload:
-                try:
-                    _, budget = validate_fusion_profile_payload(job.profile_payload)
-                    job_deadline = budget["job_deadline"]
-                except Exception:
-                    pass
-
-            try:
-                await asyncio.wait_for(self._execute_fusion_job(job), timeout=job_deadline)
-            except TimeoutError:
-                _LOGGER.warning(
-                    "Fusion job %s timed out after %ss deadline", job.incident_id, job_deadline
-                )
-                await self._handle_fusion_job_failure(
-                    job,
-                    AnalysisError(
-                        "TIMEOUT",
-                        "Fusion execution deadline exceeded",
-                        retryable=True,
-                        timeout_source="job",
-                    ),
-                )
-            except asyncio.CancelledError:
-                _LOGGER.info(
-                    "Fusion job %s cancelled during execution; leaving recoverable",
-                    job.incident_id,
-                )
-                raise
-            except Exception as err:
-                _LOGGER.error(
-                    "Execution error on fusion job %s: %s",
-                    job.incident_id,
-                    sanitize_error_code(err),
-                )
-                await self._handle_fusion_job_failure(job, err)
-        finally:
-            self._semaphore.release()
+        await self._run_claimed(job, fusion=True)
 
     async def _execute_fusion_job(self, job: FusionJob) -> None:
         """Execute single multi-camera incident visual fusion job with CAS protection."""
@@ -1259,9 +1117,8 @@ class AnalysisWorker:
             ):
                 return
 
-            semantic, budget = validate_fusion_profile_payload(
-                job.profile_payload, expected_digest=job.profile_digest
-            )
+            profile = load_profile(job.profile_payload, job.profile_digest, fusion=True)
+            semantic, budget = profile.semantic, profile.budget
             job_model = semantic["model"]
             job_instructions = semantic["instructions"]
             job_fusion_prompt = semantic["fusion_prompt"]
@@ -1412,7 +1269,7 @@ class AnalysisWorker:
         try:
             lease_duration = derive_lease_pin_seconds(job_deadline)
             for ev in available_events:
-                pin = await self._rec_api.store.pin_media_lease(
+                pin = await self._rec_api.pin_media_lease(
                     event_id=ev.event_id,
                     lease_seconds=lease_duration,
                     reason="event_vision incident fusion",
@@ -1450,6 +1307,7 @@ class AnalysisWorker:
                         max_frames=per_ev_limit,
                         policy=job_policy,
                         extraction_timeout=job_extraction_timeout,
+                        reuse_compatible=True,
                     )
                     for rf in raw_frames:
                         view_extracted_frames.append((ev, rf))
@@ -1635,7 +1493,7 @@ class AnalysisWorker:
         job_max_attempts = self._max_attempts
         if job.profile_payload:
             try:
-                _, budget = validate_fusion_profile_payload(job.profile_payload)
+                budget = load_profile(job.profile_payload, job.profile_digest, fusion=True).budget
                 job_max_attempts = budget["max_attempts"]
             except Exception:
                 pass

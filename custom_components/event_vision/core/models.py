@@ -16,6 +16,10 @@ from typing import Any
 from custom_components.event_recording.core.models import (
     compute_incident_input_token as compute_incident_input_token,
 )
+from custom_components.event_recording.core.validation import (
+    NumberSpec,
+    ValidationError,
+)
 
 from ..const import (
     CAS_CLEANUP_MARGIN_SECONDS,
@@ -60,80 +64,6 @@ from ..const import (
     VALID_SAMPLING_POLICIES,
     VALID_STATUSES,
 )
-
-try:
-    from custom_components.event_recording.core.validation import (
-        FieldSpec,
-        IdSpec,
-        NumberSpec,
-        StringSpec,
-        ValidationError,
-        validate_bounded_string,
-        validate_number,
-        validate_safe_id,
-    )
-except ImportError:
-    try:
-        from ...event_recording.core.validation import (  # noqa: F401
-            FieldSpec,
-            IdSpec,
-            NumberSpec,
-            StringSpec,
-            ValidationError,
-            validate_bounded_string,
-            validate_number,
-            validate_safe_id,
-        )
-    except ImportError:
-
-        class ValidationError(ValueError):  # type: ignore[no-redef]
-            pass
-
-        @dataclass(frozen=True, slots=True)
-        class FieldSpec:  # type: ignore[no-redef]
-            name: str
-            allow_none: bool = False
-            default: Any = None
-
-            def validate(self, val: Any) -> Any:
-                raise NotImplementedError
-
-        @dataclass(frozen=True, slots=True)
-        class NumberSpec(FieldSpec):  # type: ignore[no-redef]
-            min_val: float | int | None = None
-            max_val: float | int | None = None
-            is_integer: bool = False
-            integer: bool = False
-            allow_zero: bool = True
-            default: float | int | None = None
-
-            def validate(self, val: Any) -> float | int | None:
-                if val is None:
-                    if self.allow_none:
-                        return self.default
-                    raise ValidationError(f"{self.name} cannot be None")
-                if isinstance(val, bool) or not isinstance(val, (int, float)):
-                    raise ValidationError(f"{self.name} must be a number, got {type(val).__name__}")
-                try:
-                    num_float = float(val)
-                except OverflowError as err:
-                    raise ValidationError(f"{self.name} too large") from err
-                if not math.isfinite(num_float):
-                    raise ValidationError(f"{self.name} must be finite")
-                if self.is_integer or self.integer:
-                    if isinstance(val, float) and not val.is_integer():
-                        raise ValidationError(f"{self.name} must be an integer")
-                    result = int(val)
-                else:
-                    result = float(val) if isinstance(val, int) else val
-                if not self.allow_zero and result == 0:
-                    raise ValidationError(f"{self.name} cannot be zero")
-                if self.min_val is not None and result < self.min_val:
-                    raise ValidationError(f"{self.name} must be >= {self.min_val}")
-                if self.max_val is not None and result > self.max_val:
-                    raise ValidationError(f"{self.name} must be <= {self.max_val}")
-                return result
-
 
 # Canonical shared declarative specifications for Event Vision
 SPEC_CONCURRENCY = NumberSpec(

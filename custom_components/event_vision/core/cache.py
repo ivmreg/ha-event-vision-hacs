@@ -103,6 +103,11 @@ class FrameCache:
         return self._max_bytes > 0
 
     @property
+    def epoch(self) -> int:
+        """Fence batched extraction against clear/close while decoding."""
+        return self._epoch
+
+    @property
     def max_bytes(self) -> int:
         """Return configured maximum byte budget."""
         return self._max_bytes
@@ -219,6 +224,7 @@ class FrameCache:
         source_fingerprint: str | None = None,
         media_revision: int | None = None,
         extraction_settings: str = DEFAULT_EXTRACTION_SETTINGS,
+        epoch: int | None = None,
     ) -> bool:
         """Store validated raw frame bytes in LRU cache respecting byte bound."""
         if not self.enabled or self._closed:
@@ -232,6 +238,8 @@ class FrameCache:
             return False
 
         async with self._lock:
+            if epoch is not None and epoch != self._epoch:
+                return False
             return self._put_locked(
                 key=key,
                 frame_data=frame_data,
@@ -280,7 +288,10 @@ class FrameCache:
 
             if key in self._in_flight:
                 future = self._in_flight[key]
-                _LOGGER.debug("FrameCache coalescing concurrent extraction for key: %s (in-flight waiter)", key)
+                _LOGGER.debug(
+                    "FrameCache coalescing concurrent extraction for key: %s (in-flight waiter)",
+                    key,
+                )
             else:
                 loop = asyncio.get_running_loop()
                 future = loop.create_future()

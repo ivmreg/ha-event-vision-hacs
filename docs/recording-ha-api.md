@@ -117,6 +117,8 @@ Set `chunk_seconds` and `max_window_seconds` on the camera profile in **Options 
 
 Lookback relies on Home Assistant stream buffering/preload for the selected camera. The setting cannot guarantee that pre-trigger footage is available.
 
+The optional go2rtc provider is selected per camera profile with `recording_provider: go2rtc`. Configure a shared HTTP(S) base URL and optional HTTP Basic credentials in **Options -> go2rtc Connection**, then enter the named go2rtc stream alias in that camera's profile. Credentials belong in the options form, never in `recorder_config`. The provider accepts only `extend` and `native_fixed`. It continuously collects video-only fragmented MP4 segments into bounded memory before an event, then exports available keyframe-aligned pre-roll and post-event fragments through the normal staging and promotion path. A restart, stream outage, or warm-up can shorten pre-roll; gaps and shortfalls are reported as partial, and `extend` can have gaps between chunks. The provider does not establish calibrated visual UTC timestamps.
+
 The original explicit `resource_key` and `recorder_config` form remains supported for existing automations:
 
 ```yaml

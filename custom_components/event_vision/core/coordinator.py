@@ -11,6 +11,9 @@ import json
 import logging
 from typing import Any
 
+from custom_components.event_recording.contracts import RecordingConsumerAPI
+from custom_components.event_recording.core.notifications import RevisionDispatcher
+
 from ..const import (
     ANNOTATION_NAMESPACE,
     CONSUMER_ID,
@@ -56,7 +59,7 @@ class VisionCoordinator:
         self,
         job_store: AnalysisJobStore,
         worker: AnalysisWorker,
-        recording_api: Any,
+        recording_api: RecordingConsumerAPI,
         auto_analyze: bool = True,
         model: str = "gemini-flash-lite-latest",
         prompt_instructions: str | None = None,
@@ -100,7 +103,12 @@ class VisionCoordinator:
         self._unsub_recording: Any = None
         self._unsub_incidents: Any = None
         self._unsub_consumer: Any = None
-        self._notification_tasks: set[asyncio.Task[None]] = set()
+        self._event_dispatcher = RevisionDispatcher(
+            self.async_handle_event_notification, self._catch_up_events
+        )
+        self._incident_dispatcher = RevisionDispatcher(
+            self.async_handle_incident_notification, self._scan_incidents
+        )
 
     def _get_event_lock(self, event_id: str) -> asyncio.Lock:
         return self.worker.event_lock(event_id)
@@ -161,7 +169,7 @@ class VisionCoordinator:
             fusion_prompt=DEFAULT_FUSION_PROMPT,
         )
 
-    def bind_recording_api(self, rec_api: Any, available: bool = True) -> None:
+    def bind_recording_api(self, rec_api: RecordingConsumerAPI, available: bool = True) -> None:
         """Bind or rebind recording API facade and setup subscriptions cleanly."""
         self.unbind_recording_api()
         self.rec_api = rec_api
@@ -187,26 +195,37 @@ class VisionCoordinator:
             is_busy=_is_consumer_busy,
         )
 
-        def _on_event_change(event_id: str, revision: int) -> None:
-            task = asyncio.create_task(self.async_handle_event_notification(event_id, revision))
-            self._notification_tasks.add(task)
-            task.add_done_callback(self._notification_tasks.discard)
+        self._event_dispatcher = RevisionDispatcher(
+            self.async_handle_event_notification, self._catch_up_events
+        )
+        self._incident_dispatcher = RevisionDispatcher(
+            self.async_handle_incident_notification, self._scan_incidents
+        )
+        self._unsub_recording = rec_api.subscribe(self._event_dispatcher.notify)
+        if self.enable_fusion and hasattr(rec_api, "subscribe_incidents"):
+            self._unsub_incidents = rec_api.subscribe_incidents(self._incident_dispatcher.notify)
 
-        self._unsub_recording = rec_api.subscribe(_on_event_change)
+    async def _catch_up_events(self) -> None:
+        if self.auto_analyze:
+            await self.async_scan_unprocessed_media()
 
-        if hasattr(rec_api, "subscribe_incidents"):
-
-            def _on_incident_change(incident_id: str, revision: int) -> None:
-                task = asyncio.create_task(
-                    self.async_handle_incident_notification(incident_id, revision)
+    async def _scan_incidents(self) -> None:
+        if not self.enable_fusion:
+            return
+        cursor = None
+        while True:
+            incidents, cursor = await self.rec_api.list_incidents(limit=50, before_cursor=cursor)
+            for incident in incidents:
+                await self.async_handle_incident_notification(
+                    incident.incident_id, incident.membership_revision
                 )
-                self._notification_tasks.add(task)
-                task.add_done_callback(self._notification_tasks.discard)
-
-            self._unsub_incidents = rec_api.subscribe_incidents(_on_incident_change)
+            if not cursor:
+                break
 
     def unbind_recording_api(self) -> None:
         """Unbind and unsubscribe from recording API facade."""
+        self._event_dispatcher.close()
+        self._incident_dispatcher.close()
         if self._unsub_recording:
             try:
                 self._unsub_recording()
@@ -242,8 +261,6 @@ class VisionCoordinator:
             profile_digest=self.profile_digest,
             profile_payload=self.profile_payload,
         )
-        if self.fusion_job_store:
-            await self.fusion_job_store.open()
         self.worker.start()
 
         if self.auto_analyze:
@@ -254,7 +271,7 @@ class VisionCoordinator:
 
         Never performs automatic archive sweeps of already-annotated media.
         """
-        if not self.rec_api.store.is_open:
+        if not self.rec_api.is_open:
             return 0
         enqueued_count = 0
         cursor = None
@@ -262,7 +279,7 @@ class VisionCoordinator:
         res_ttl = derive_reservation_ttl(self.job_deadline)
 
         while True:
-            items, next_cursor = await self.rec_api.store.list_finalized_media(
+            items, next_cursor = await self.rec_api.list_finalized_media(
                 cursor=cursor, limit=50, namespace_lacking=ANNOTATION_NAMESPACE
             )
             for item in items:
@@ -282,7 +299,7 @@ class VisionCoordinator:
                     ):
                         continue
 
-                    ann_gen = await self.rec_api.store.reserve_annotation(
+                    ann_gen = await self.rec_api.reserve_annotation(
                         event_id=event_id,
                         namespace=ANNOTATION_NAMESPACE,
                         expected_media_revision=media_rev,
@@ -314,7 +331,7 @@ class VisionCoordinator:
 
     async def async_handle_event_notification(self, event_id: str, revision: int) -> None:
         """Handle post-commit recording subscription update without infinite loop."""
-        if not self.rec_api.store.is_open:
+        if not self.rec_api.is_open:
             return
 
         _LOGGER.debug(
@@ -343,7 +360,7 @@ class VisionCoordinator:
                         event_id, event.media_revision
                     ):
                         res_ttl = derive_reservation_ttl(self.job_deadline)
-                        ann_gen = await self.rec_api.store.reserve_annotation(
+                        ann_gen = await self.rec_api.reserve_annotation(
                             event_id=event_id,
                             namespace=ANNOTATION_NAMESPACE,
                             expected_media_revision=event.media_revision,
@@ -373,13 +390,7 @@ class VisionCoordinator:
             try:
                 member_incidents = await self.rec_api.list_event_incidents(event_id)
                 for inc in member_incidents:
-                    task = asyncio.create_task(
-                        self.async_handle_incident_notification(
-                            inc.incident_id, inc.membership_revision
-                        )
-                    )
-                    self._notification_tasks.add(task)
-                    task.add_done_callback(self._notification_tasks.discard)
+                    self._incident_dispatcher.notify(inc.incident_id, inc.membership_revision)
             except Exception as err:
                 _LOGGER.warning(
                     "Error checking incident membership for event %s: %s", event_id, err
@@ -387,7 +398,7 @@ class VisionCoordinator:
 
     async def async_handle_incident_notification(self, incident_id: str, revision: int) -> None:
         """Handle post-commit incident notification to enqueue visual fusion when eligible."""
-        if not self.enable_fusion or not self.rec_api.store.is_open or not self.fusion_job_store:
+        if not self.enable_fusion or not self.rec_api.is_open or not self.fusion_job_store:
             return
 
         _LOGGER.debug(
@@ -459,7 +470,7 @@ class VisionCoordinator:
 
     async def async_manual_analyze(self, event_id: str) -> bool:
         """Handle manual retry: supersedes existing generation atomically."""
-        if not self.rec_api.store.is_open:
+        if not self.rec_api.is_open:
             return False
         _LOGGER.debug("Manual analysis requested for event %s", event_id)
         async with self._get_event_lock(event_id):
@@ -468,7 +479,7 @@ class VisionCoordinator:
                 return False
 
             res_ttl = derive_reservation_ttl(self.job_deadline)
-            ann_gen = await self.rec_api.store.reserve_annotation(
+            ann_gen = await self.rec_api.reserve_annotation(
                 event_id=event_id,
                 namespace=ANNOTATION_NAMESPACE,
                 expected_media_revision=event.media_revision,
@@ -496,7 +507,7 @@ class VisionCoordinator:
 
     async def async_manual_analyze_incident(self, incident_id: str) -> bool:
         """Handle manual retry for incident: reserves annotation and enqueues manual job."""
-        if not self.enable_fusion or not self.rec_api.store.is_open or not self.fusion_job_store:
+        if not self.enable_fusion or not self.rec_api.is_open or not self.fusion_job_store:
             return False
 
         _LOGGER.debug("Manual fusion analysis requested for incident %s", incident_id)
@@ -537,13 +548,6 @@ class VisionCoordinator:
     async def async_shutdown(self) -> None:
         """Cleanly unsubscribe, cancel background tasks, and stop worker."""
         self.unbind_recording_api()
-        for t in list(self._notification_tasks):
-            if not t.done():
-                t.cancel()
-        if self._notification_tasks:
-            await asyncio.gather(*self._notification_tasks, return_exceptions=True)
-            self._notification_tasks.clear()
+        await self._event_dispatcher.wait()
+        await self._incident_dispatcher.wait()
         await self.worker.stop()
-        await self.job_store.close()
-        if self.fusion_job_store:
-            await self.fusion_job_store.close()

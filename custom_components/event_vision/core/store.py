@@ -14,10 +14,7 @@ Features:
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import sqlite3
-import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -29,12 +26,10 @@ from ..const import (
 )
 from .models import (
     AnalysisJob,
-    canonical_profile_json,
     ensure_utc,
-    format_iso,
     utc_now,
 )
-from .queue import DurableQueueEngine, QueueSpec
+from .queue import DurableQueueEngine, QueueSpec, normalize_claim_token
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -71,16 +66,6 @@ class AnalysisJobStore:
     def db_path(self) -> Path:
         """Return database path."""
         return self._engine.db_path
-
-    @property
-    def _lock(self) -> threading.RLock:
-        """Return thread lock for backward compatibility with tests."""
-        return self._engine.lock
-
-    @property
-    def _conn(self) -> sqlite3.Connection | None:
-        """Return connection for backward compatibility with tests."""
-        return self._engine.conn
 
     async def open(self) -> None:
         """Open database connection off the event loop and initialize schema."""
@@ -153,16 +138,11 @@ class AnalysisJobStore:
         token: str | None = None,
     ) -> bool:
         """Mark job as complete with transactional CAS verification."""
-        effective_token = (
-            token
-            if token is not None
-            else (lease_token if lease_token is not None else claim_token)
-        )
+        effective_token = normalize_claim_token(claim_token, lease_token, token)
         return await self._engine.complete(
             job_id=job_id,
             generation=generation,
             claim_token=effective_token,
-            lease_token=effective_token,
         )
 
     async def fail_job(
@@ -177,11 +157,7 @@ class AnalysisJobStore:
         token: str | None = None,
     ) -> bool:
         """Fail job with CAS verification and exponential retry backoff."""
-        effective_token = (
-            token
-            if token is not None
-            else (lease_token if lease_token is not None else claim_token)
-        )
+        effective_token = normalize_claim_token(claim_token, lease_token, token)
         return await self._engine.fail(
             job_id=job_id,
             generation=generation,
@@ -189,7 +165,6 @@ class AnalysisJobStore:
             retryable=retryable,
             backoff_seconds=backoff_seconds,
             claim_token=effective_token,
-            lease_token=effective_token,
         )
 
     async def skip_job(
@@ -202,17 +177,12 @@ class AnalysisJobStore:
         token: str | None = None,
     ) -> bool:
         """Mark job as skipped with CAS verification."""
-        effective_token = (
-            token
-            if token is not None
-            else (lease_token if lease_token is not None else claim_token)
-        )
+        effective_token = normalize_claim_token(claim_token, lease_token, token)
         return await self._engine.skip(
             job_id=job_id,
             generation=generation,
             reason=reason,
             claim_token=effective_token,
-            lease_token=effective_token,
         )
 
     async def defer_job(
@@ -225,17 +195,12 @@ class AnalysisJobStore:
         token: str | None = None,
     ) -> bool:
         """Defer job to pending without burning an attempt."""
-        effective_token = (
-            token
-            if token is not None
-            else (lease_token if lease_token is not None else claim_token)
-        )
+        effective_token = normalize_claim_token(claim_token, lease_token, token)
         return await self._engine.defer(
             job_id=job_id,
             generation=generation,
             delay_seconds=delay_seconds,
             claim_token=effective_token,
-            lease_token=effective_token,
         )
 
     async def update_job_annotation_generation(
@@ -248,17 +213,12 @@ class AnalysisJobStore:
         token: str | None = None,
     ) -> bool:
         """Update annotation generation with CAS generation check."""
-        effective_token = (
-            token
-            if token is not None
-            else (lease_token if lease_token is not None else claim_token)
-        )
+        effective_token = normalize_claim_token(claim_token, lease_token, token)
         return await self._engine.update_annotation_generation(
             job_id=job_id,
             generation=generation,
             annotation_generation=annotation_generation,
             claim_token=effective_token,
-            lease_token=effective_token,
         )
 
     async def update_job_payload(self, job_id: int, payload: str | dict[str, Any]) -> bool:
@@ -266,27 +226,7 @@ class AnalysisJobStore:
         return await self._engine.update_payload(job_id=job_id, payload=payload)
 
     async def supersede_older_revisions(self, event_id: str, current_media_revision: int) -> int:
-        """Mark older jobs for event_id as superseded."""
-        return await asyncio.to_thread(
-            self._sync_supersede_older_revisions, event_id, current_media_revision
-        )
-
-    def _sync_supersede_older_revisions(self, event_id: str, current_media_revision: int) -> int:
-        now_str = format_iso(utc_now()) or ""
-        with self._engine.lock:
-            conn = self._engine.conn
-            assert conn is not None
-            cur = conn.cursor()
-            cur.execute(
-                """
-                UPDATE analysis_jobs
-                SET status = 'superseded', updated_at = ?
-                WHERE event_id = ? AND media_revision < ? AND status IN ('pending', 'leased');
-                """,
-                (now_str, event_id, current_media_revision),
-            )
-            conn.commit()
-            return cur.rowcount
+        return await self._engine.supersede_older_revisions(event_id, current_media_revision)
 
     async def supersede_job(
         self,
@@ -297,84 +237,24 @@ class AnalysisJobStore:
         token: str | None = None,
     ) -> bool:
         """Retire only the rejected attempt, preserving newer jobs for the same media."""
-        effective_token = (
-            token
-            if token is not None
-            else (lease_token if lease_token is not None else claim_token)
-        )
+        effective_token = normalize_claim_token(claim_token, lease_token, token)
         return await self._engine.supersede(
             job_id=job_id,
             generation=generation,
             claim_token=effective_token,
-            lease_token=effective_token,
         )
 
     async def get_job(
-        self,
-        event_id: str,
-        media_revision: int,
-        profile_digest: str,
+        self, event_id: str, media_revision: int, profile_digest: str
     ) -> AnalysisJob | None:
-        """Retrieve job by unique compound key."""
-        return await asyncio.to_thread(self._sync_get_job, event_id, media_revision, profile_digest)
-
-    def _sync_get_job(
-        self,
-        event_id: str,
-        media_revision: int,
-        profile_digest: str,
-    ) -> AnalysisJob | None:
-        with self._engine.lock:
-            conn = self._engine.conn
-            if not conn:
-                return None
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT * FROM analysis_jobs
-                WHERE event_id = ? AND media_revision = ? AND profile_digest = ?;
-                """,
-                (event_id, media_revision, profile_digest),
-            )
-            row = cur.fetchone()
-            return self._row_to_job(row) if row else None
+        row = await self._engine.get_job_by_inputs(event_id, media_revision, profile_digest)
+        return self._row_to_job(row) if row else None
 
     async def get_latest_job_for_event(
         self, event_id: str, media_revision: int | None = None
     ) -> AnalysisJob | None:
-        """Retrieve the newest job recorded for an event."""
-        return await asyncio.to_thread(
-            self._sync_get_latest_job_for_event, event_id, media_revision
-        )
-
-    def _sync_get_latest_job_for_event(
-        self, event_id: str, media_revision: int | None = None
-    ) -> AnalysisJob | None:
-        with self._engine.lock:
-            conn = self._engine.conn
-            if not conn:
-                return None
-            cur = conn.cursor()
-            if media_revision is not None:
-                cur.execute(
-                    """
-                    SELECT * FROM analysis_jobs
-                    WHERE event_id = ? AND media_revision = ?
-                    ORDER BY id DESC LIMIT 1;
-                    """,
-                    (event_id, media_revision),
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT * FROM analysis_jobs
-                    WHERE event_id = ?
-                    ORDER BY id DESC LIMIT 1;
-                    """,
-                    (event_id,),
-                )
-            row = cur.fetchone()
-            return self._row_to_job(row) if row else None
+        row = await self._engine.get_latest_for_target(event_id, revision=media_revision)
+        return self._row_to_job(row) if row else None
 
     async def is_job_current(
         self,
@@ -385,16 +265,11 @@ class AnalysisJobStore:
         token: str | None = None,
     ) -> bool:
         """Return True if job is still active under the specified generation."""
-        effective_token = (
-            token
-            if token is not None
-            else (lease_token if lease_token is not None else claim_token)
-        )
+        effective_token = normalize_claim_token(claim_token, lease_token, token)
         return await self._engine.is_current(
             job_id=job_id,
             generation=generation,
             claim_token=effective_token,
-            lease_token=effective_token,
         )
 
     async def recover_expired_leases(self, force_all: bool = False) -> int:
@@ -414,144 +289,13 @@ class AnalysisJobStore:
 
         Leaves historical completed, skipped, or failed archive results untouched.
         """
-        return await asyncio.to_thread(
-            self._sync_migrate_legacy_pending_jobs, profile_digest, profile_payload
-        )
-
-    def _sync_migrate_legacy_pending_jobs(
-        self, profile_digest: str, profile_payload: str | dict[str, Any]
-    ) -> int:
-        if isinstance(profile_payload, dict):
-            profile_payload = canonical_profile_json(profile_payload)
-        now_str = format_iso(utc_now()) or ""
-        with self._engine.lock:
-            conn = self._engine.conn
-            if not conn:
-                return 0
-            cur = conn.cursor()
-            cur.execute("BEGIN IMMEDIATE;")
-            try:
-                cur.execute(
-                    """
-                    SELECT DISTINCT event_id, media_revision
-                    FROM analysis_jobs
-                    WHERE profile_payload IS NULL AND status IN ('pending', 'leased');
-                    """
-                )
-                groups = cur.fetchall()
-                migrated_count = 0
-
-                for grp in groups:
-                    e_id = grp["event_id"]
-                    m_rev = grp["media_revision"]
-
-                    cur.execute(
-                        """
-                        SELECT id, status, is_manual, profile_payload FROM analysis_jobs
-                        WHERE event_id = ? AND media_revision = ? AND profile_digest = ?;
-                        """,
-                        (e_id, m_rev, profile_digest),
-                    )
-                    target_row = cur.fetchone()
-                    target_existing = None
-                    if target_row:
-                        if target_row["profile_payload"] is not None or target_row[
-                            "status"
-                        ] not in (
-                            "pending",
-                            "leased",
-                        ):
-                            target_existing = target_row
-
-                    cur.execute(
-                        """
-                        SELECT id, status, is_manual, profile_digest FROM analysis_jobs
-                        WHERE event_id = ? AND media_revision = ? AND profile_payload IS NULL
-                              AND status IN ('pending', 'leased')
-                        ORDER BY (profile_digest = ?) DESC, is_manual DESC, id DESC;
-                        """,
-                        (e_id, m_rev, profile_digest),
-                    )
-                    candidates = cur.fetchall()
-                    if not candidates:
-                        continue
-
-                    if target_existing:
-                        if target_existing["status"] in ("pending", "leased"):
-                            if (
-                                any(c["is_manual"] for c in candidates)
-                                and not target_existing["is_manual"]
-                            ):
-                                cur.execute(
-                                    "UPDATE analysis_jobs SET is_manual = 1, updated_at = ? WHERE id = ?;",
-                                    (now_str, target_existing["id"]),
-                                )
-                        for c in candidates:
-                            cur.execute(
-                                """
-                                UPDATE analysis_jobs
-                                SET status = 'superseded', last_error = 'SUPERSEDED_BY_CURRENT_PROFILE',
-                                    leased_by = NULL, leased_until = NULL, updated_at = ?
-                                WHERE id = ?;
-                                """,
-                                (now_str, c["id"]),
-                            )
-                    else:
-                        winner = candidates[0]
-                        winner_is_manual = max(c["is_manual"] for c in candidates)
-                        cur.execute(
-                            """
-                            UPDATE analysis_jobs
-                            SET profile_digest = ?, profile_payload = ?, is_manual = ?, updated_at = ?
-                            WHERE id = ?;
-                            """,
-                            (
-                                profile_digest,
-                                profile_payload,
-                                winner_is_manual,
-                                now_str,
-                                winner["id"],
-                            ),
-                        )
-                        migrated_count += 1
-
-                        for other in candidates[1:]:
-                            cur.execute(
-                                """
-                                UPDATE analysis_jobs
-                                SET status = 'superseded', last_error = 'SUPERSEDED_BY_COALESCED_PROFILE',
-                                    leased_by = NULL, leased_until = NULL, updated_at = ?
-                                WHERE id = ?;
-                                """,
-                                (now_str, other["id"]),
-                            )
-
-                conn.commit()
-                return migrated_count
-            except Exception:
-                conn.rollback()
-                raise
+        return await self._engine.migrate_legacy_pending(profile_digest, profile_payload)
 
     async def should_auto_enqueue(self, event_id: str, media_revision: int) -> bool:
-        """Check whether an event revision is eligible for automatic enqueueing."""
-        return await asyncio.to_thread(self._sync_should_auto_enqueue, event_id, media_revision)
+        return await self._engine.get_latest_for_target(event_id, revision=media_revision) is None
 
-    def _sync_should_auto_enqueue(self, event_id: str, media_revision: int) -> bool:
-        with self._engine.lock:
-            conn = self._engine.conn
-            if not conn:
-                return False
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT status FROM analysis_jobs
-                WHERE event_id = ? AND media_revision = ?
-                ORDER BY id DESC LIMIT 1;
-                """,
-                (event_id, media_revision),
-            )
-            row = cur.fetchone()
-            return row is None
+    async def compact(self) -> int:
+        return await self._engine.compact_terminal()
 
     def _row_to_job(self, row: dict[str, Any]) -> AnalysisJob:
         return AnalysisJob(

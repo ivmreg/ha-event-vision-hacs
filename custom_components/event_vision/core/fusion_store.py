@@ -6,10 +6,7 @@ Backed by common DurableQueueEngine core.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import sqlite3
-import threading
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +19,7 @@ from .models import (
     ensure_utc,
     utc_now,
 )
-from .queue import DurableQueueEngine, QueueSpec
+from .queue import DurableQueueEngine, QueueSpec, normalize_claim_token
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,7 +33,9 @@ def validate_safe_id(val: str, field_name: str) -> None:
 def validate_bounded_string(val: str, field_name: str, max_len: int = 512) -> None:
     """Validate string length bounds."""
     if not isinstance(val, str) or not val.strip() or len(val) > max_len:
-        raise ValueError(f"Invalid {field_name}: must be non-empty string up to {max_len} characters")
+        raise ValueError(
+            f"Invalid {field_name}: must be non-empty string up to {max_len} characters"
+        )
 
 
 class FusionJobStore:
@@ -71,16 +70,6 @@ class FusionJobStore:
     def db_path(self) -> Path:
         """Return database path."""
         return self._engine.db_path
-
-    @property
-    def _lock(self) -> threading.RLock:
-        """Return thread lock for backward compatibility with tests."""
-        return self._engine.lock
-
-    @property
-    def _conn(self) -> sqlite3.Connection | None:
-        """Return connection for backward compatibility with tests."""
-        return self._engine.conn
 
     async def open(self) -> None:
         """Open the SQLite connection, apply pragmas, and ensure tables exist."""
@@ -122,28 +111,11 @@ class FusionJobStore:
         validate_safe_id(incident_id, "incident_id")
         validate_bounded_string(input_token, "input_token")
         validate_bounded_string(profile_digest, "profile_digest")
-        return await asyncio.to_thread(
-            self._sync_get_job_by_inputs, incident_id, input_token, profile_digest
-        )
+        row = await self._engine.get_job_by_inputs(incident_id, input_token, profile_digest)
+        return self._row_to_job(row) if row else None
 
-    def _sync_get_job_by_inputs(
-        self, incident_id: str, input_token: str, profile_digest: str
-    ) -> FusionJob | None:
-        with self._engine.lock:
-            conn = self._engine.conn
-            assert conn is not None
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT * FROM fusion_jobs
-                WHERE incident_id = ? AND input_token = ? AND profile_digest = ?;
-                """,
-                (incident_id, input_token, profile_digest),
-            )
-            row = cur.fetchone()
-            if not row:
-                return None
-            return self._row_to_job(row)
+    async def compact(self) -> int:
+        return await self._engine.compact_terminal()
 
     async def lease_fusion_job(
         self, worker_id: str, lease_seconds: float = 300.0
@@ -162,9 +134,9 @@ class FusionJobStore:
         token: str | None = None,
     ) -> bool:
         """Atomically transition a leased fusion job to complete."""
-        effective_token = token if token is not None else (lease_token if lease_token is not None else claim_token)
+        effective_token = normalize_claim_token(claim_token, lease_token, token)
         return await self._engine.complete(
-            job_id=job_id, generation=generation, claim_token=effective_token, lease_token=effective_token
+            job_id=job_id, generation=generation, claim_token=effective_token
         )
 
     async def fail_fusion_job(
@@ -180,7 +152,7 @@ class FusionJobStore:
     ) -> bool:
         """Mark fusion job as failed or schedule backoff retry with CAS protection."""
         validate_bounded_string(error_code, "error_code")
-        effective_token = token if token is not None else (lease_token if lease_token is not None else claim_token)
+        effective_token = normalize_claim_token(claim_token, lease_token, token)
         return await self._engine.fail(
             job_id=job_id,
             generation=generation,
@@ -188,7 +160,6 @@ class FusionJobStore:
             retryable=retryable,
             backoff_seconds=backoff_seconds,
             claim_token=effective_token,
-            lease_token=effective_token,
         )
 
     async def skip_fusion_job(
@@ -202,9 +173,9 @@ class FusionJobStore:
     ) -> bool:
         """Mark fusion job as skipped."""
         validate_bounded_string(reason, "reason")
-        effective_token = token if token is not None else (lease_token if lease_token is not None else claim_token)
+        effective_token = normalize_claim_token(claim_token, lease_token, token)
         return await self._engine.skip(
-            job_id=job_id, generation=generation, reason=reason, claim_token=effective_token, lease_token=effective_token
+            job_id=job_id, generation=generation, reason=reason, claim_token=effective_token
         )
 
     async def supersede_fusion_job(
@@ -216,9 +187,9 @@ class FusionJobStore:
         token: str | None = None,
     ) -> bool:
         """Mark fusion job as superseded with CAS generation protection."""
-        effective_token = token if token is not None else (lease_token if lease_token is not None else claim_token)
+        effective_token = normalize_claim_token(claim_token, lease_token, token)
         return await self._engine.supersede(
-            job_id=job_id, generation=generation, claim_token=effective_token, lease_token=effective_token
+            job_id=job_id, generation=generation, claim_token=effective_token
         )
 
     async def defer_fusion_job(
@@ -233,13 +204,12 @@ class FusionJobStore:
     ) -> bool:
         """Defer fusion job to pending with a short retry delay without consuming attempts."""
         effective_delay = delay_seconds if delay_seconds is not None else defer_seconds
-        effective_token = token if token is not None else (lease_token if lease_token is not None else claim_token)
+        effective_token = normalize_claim_token(claim_token, lease_token, token)
         return await self._engine.defer(
             job_id=job_id,
             generation=generation,
             delay_seconds=effective_delay,
             claim_token=effective_token,
-            lease_token=effective_token,
         )
 
     async def is_fusion_job_current(
@@ -251,9 +221,9 @@ class FusionJobStore:
         token: str | None = None,
     ) -> bool:
         """Return True if job is still active under the specified generation."""
-        effective_token = token if token is not None else (lease_token if lease_token is not None else claim_token)
+        effective_token = normalize_claim_token(claim_token, lease_token, token)
         return await self._engine.is_current(
-            job_id=job_id, generation=generation, claim_token=effective_token, lease_token=effective_token
+            job_id=job_id, generation=generation, claim_token=effective_token
         )
 
     async def update_job_annotation_generation(
@@ -266,13 +236,12 @@ class FusionJobStore:
         token: str | None = None,
     ) -> bool:
         """Update annotation generation with CAS generation check."""
-        effective_token = token if token is not None else (lease_token if lease_token is not None else claim_token)
+        effective_token = normalize_claim_token(claim_token, lease_token, token)
         return await self._engine.update_annotation_generation(
             job_id=job_id,
             generation=generation,
             annotation_generation=annotation_generation,
             claim_token=effective_token,
-            lease_token=effective_token,
         )
 
     async def recover_expired_leases(self, force_all: bool = False) -> int:
@@ -314,7 +283,9 @@ class FusionJobStore:
             attempts=row["attempts"],
             leased_by=row["leased_by"],
             leased_until=ensure_utc(row["leased_until"]) if row.get("leased_until") else None,
-            next_attempt_at=ensure_utc(row["next_attempt_at"]) if row.get("next_attempt_at") else None,
+            next_attempt_at=ensure_utc(row["next_attempt_at"])
+            if row.get("next_attempt_at")
+            else None,
             last_error=row["last_error"],
             is_manual=bool(row["is_manual"]),
             created_at=ensure_utc(row["created_at"]) if row.get("created_at") else utc_now(),

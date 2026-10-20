@@ -29,6 +29,7 @@ from ..const import (
     DEFAULT_MAX_ATTEMPTS,
 )
 from .models import (
+    canonical_profile_json,
     derive_queue_lease_seconds,
     ensure_utc,
     format_iso,
@@ -42,6 +43,13 @@ MAX_BACKOFF_SECONDS = 300.0
 DEFAULT_RETRY_DELAY_SECONDS = 5.0
 
 SAFE_IDENTIFIER_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def normalize_claim_token(
+    claim_token: str | None, lease_token: str | None, token: str | None
+) -> str | None:
+    """Normalize legacy store keywords once; the engine only accepts claim_token."""
+    return token if token is not None else (lease_token if lease_token is not None else claim_token)
 
 
 def validate_identifier(name: str, desc: str = "identifier") -> str:
@@ -202,8 +210,8 @@ class DurableQueueEngine:
             self._conn.row_factory = _dict_factory
             cur = self._conn.cursor()
             cur.execute("PRAGMA journal_mode = WAL;")
-            cur.execute("PRAGMA busy_timeout = 30000;")
             cur.execute("PRAGMA synchronous = FULL;")
+            cur.execute("PRAGMA busy_timeout = 30000;")
 
             ann_gen_default = (
                 f"DEFAULT {self._spec.default_annotation_generation}"
@@ -246,6 +254,11 @@ class DurableQueueEngine:
                 CREATE INDEX IF NOT EXISTS idx_{self._spec.table_name}_pending
                 ON {self._spec.table_name} (status, next_attempt_at, attempts);
                 """
+            )
+
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{self._spec.table_name}_terminal "
+                f"ON {self._spec.table_name} (status, updated_at, id);"
             )
 
             if self._spec.extra_index_cols:
@@ -378,7 +391,6 @@ class DurableQueueEngine:
         with self._lock:
             assert self._conn is not None
             cur = self._conn.cursor()
-            cur.execute("PRAGMA synchronous = FULL;")
             cur.execute("BEGIN IMMEDIATE;")
             try:
                 # 1. Check existing exact match: (target_id, revision, profile_digest)
@@ -581,7 +593,6 @@ class DurableQueueEngine:
         with self._lock:
             assert self._conn is not None
             cur = self._conn.cursor()
-            cur.execute("PRAGMA synchronous = FULL;")
             cur.execute("BEGIN IMMEDIATE;")
             try:
                 # Recover expired leases first if configured
@@ -668,57 +679,54 @@ class DurableQueueEngine:
         job_id: int,
         generation: int,
         claim_token: str | None = None,
-        lease_token: str | None = None,
     ) -> bool:
         """Mark job as complete with transactional CAS and per-claim fencing verification."""
-        token = lease_token if lease_token is not None else claim_token
+        token = claim_token
         return await asyncio.to_thread(self._sync_complete, job_id, generation, token)
 
-    def _sync_complete(
+    def _claim_where(
+        self, job_id: int, generation: int, token: str | None
+    ) -> tuple[str, tuple[Any, ...]]:
+        where = "id = ? AND generation = ? AND status = 'leased' AND (leased_until IS NULL OR leased_until > ?)"
+        params: tuple[Any, ...] = (job_id, generation, format_iso(utc_now()))
+        if token is not None:
+            where += " AND claim_token = ?"
+            params += (token,)
+        return where, params
+
+    def _sync_transition(
         self,
         job_id: int,
         generation: int,
-        claim_token: str | None = None,
-        lease_token: str | None = None,
+        claim_token: str | None,
+        status: str,
+        *,
+        reason: str | None = None,
+        next_attempt_at: str | None = None,
     ) -> bool:
-        token = lease_token if lease_token is not None else claim_token
-        now_dt = utc_now()
-        now_str = format_iso(now_dt) or ""
+        """One atomic fenced transition for complete/skip/defer/supersede."""
         with self._lock:
             assert self._conn is not None
-            cur = self._conn.cursor()
-            cur.execute("PRAGMA synchronous = FULL;")
-            cur.execute("BEGIN IMMEDIATE;")
-            try:
-                if token is not None:
-                    cur.execute(
-                        f"""
-                        UPDATE {self._spec.table_name}
-                        SET status = 'complete', leased_by = NULL, leased_until = NULL, claim_token = NULL, updated_at = ?
-                        WHERE id = ? AND generation = ? AND claim_token = ? AND status = 'leased'
-                          AND (leased_until IS NULL OR leased_until > ?);
-                        """,
-                        (now_str, job_id, generation, token, now_str),
-                    )
-                else:
-                    cur.execute(
-                        f"""
-                        UPDATE {self._spec.table_name}
-                        SET status = 'complete', leased_by = NULL, leased_until = NULL, claim_token = NULL, updated_at = ?
-                        WHERE id = ? AND generation = ? AND status = 'leased'
-                          AND (leased_until IS NULL OR leased_until > ?);
-                        """,
-                        (now_str, job_id, generation, now_str),
-                    )
-                success = cur.rowcount > 0
-                cur.execute("COMMIT;")
-                return success
-            except Exception as err:
-                try:
-                    cur.execute("ROLLBACK;")
-                except Exception:
-                    pass
-                raise err
+            where, params = self._claim_where(job_id, generation, claim_token)
+            if status == "skipped" and claim_token is None:
+                where = where.replace("status = 'leased'", "status IN ('pending', 'leased')")
+            if status == "superseded":
+                where, params = "id = ? AND generation = ?", (job_id, generation)
+                if claim_token is not None:
+                    where += " AND claim_token = ?"
+                    params += (claim_token,)
+            with self._conn:
+                cur = self._conn.execute(
+                    f"""UPDATE {self._spec.table_name}
+                    SET status = ?, last_error = COALESCE(?, last_error), next_attempt_at = ?,
+                        leased_by = NULL, leased_until = NULL, claim_token = NULL, updated_at = ?
+                    WHERE {where};""",
+                    (status, reason, next_attempt_at, format_iso(utc_now()), *params),
+                )
+                return cur.rowcount > 0
+
+    def _sync_complete(self, job_id: int, generation: int, claim_token: str | None = None) -> bool:
+        return self._sync_transition(job_id, generation, claim_token, "complete")
 
     async def fail(
         self,
@@ -728,10 +736,9 @@ class DurableQueueEngine:
         retryable: bool = True,
         backoff_seconds: float = BASE_BACKOFF_SECONDS,
         claim_token: str | None = None,
-        lease_token: str | None = None,
     ) -> bool:
         """Fail job with CAS verification, per-claim fencing, and exponential retry backoff."""
-        token = lease_token if lease_token is not None else claim_token
+        token = claim_token
         return await asyncio.to_thread(
             self._sync_fail, job_id, generation, error_code, retryable, backoff_seconds, token
         )
@@ -744,120 +751,57 @@ class DurableQueueEngine:
         retryable: bool,
         backoff_seconds: float,
         claim_token: str | None = None,
-        lease_token: str | None = None,
     ) -> bool:
-        token = lease_token if lease_token is not None else claim_token
-        now_dt = utc_now()
-        now_str = format_iso(now_dt) or ""
-
+        now = utc_now()
         with self._lock:
             assert self._conn is not None
             cur = self._conn.cursor()
-            cur.execute("PRAGMA synchronous = FULL;")
             cur.execute("BEGIN IMMEDIATE;")
             try:
-                if token is not None:
-                    cur.execute(
-                        f"""
-                        SELECT attempts, profile_payload FROM {self._spec.table_name}
-                        WHERE id = ? AND generation = ? AND claim_token = ? AND status = 'leased'
-                          AND (leased_until IS NULL OR leased_until > ?);
-                        """,
-                        (job_id, generation, token, now_str),
-                    )
-                else:
-                    cur.execute(
-                        f"""
-                        SELECT attempts, profile_payload FROM {self._spec.table_name}
-                        WHERE id = ? AND generation = ? AND status = 'leased'
-                          AND (leased_until IS NULL OR leased_until > ?);
-                        """,
-                        (job_id, generation, now_str),
-                    )
+                where, params = self._claim_where(job_id, generation, claim_token)
+                cur.execute(
+                    f"SELECT attempts, profile_payload FROM {self._spec.table_name} WHERE {where};",
+                    params,
+                )
                 job = cur.fetchone()
                 if not job:
                     cur.execute("ROLLBACK;")
                     return False
-
-                payload = job.get("profile_payload")
-                effective_max_attempts = extract_payload_max_attempts(
-                    payload, self._default_max_attempts
+                attempts = job["attempts"] + 1
+                exhausted = attempts >= extract_payload_max_attempts(
+                    job.get("profile_payload"), self._default_max_attempts
                 )
-                new_attempts = job["attempts"] + 1
-
-                if not retryable or new_attempts >= effective_max_attempts:
-                    if token is not None:
-                        cur.execute(
-                            f"""
-                            UPDATE {self._spec.table_name}
-                            SET status = 'failed', attempts = ?, last_error = ?, leased_by = NULL, leased_until = NULL,
-                                claim_token = NULL, next_attempt_at = NULL, updated_at = ?
-                            WHERE id = ? AND generation = ? AND claim_token = ? AND status = 'leased';
-                            """,
-                            (new_attempts, error_code, now_str, job_id, generation, token),
+                retry = retryable and not exhausted
+                next_at = (
+                    format_iso(
+                        now
+                        + timedelta(
+                            seconds=min(MAX_BACKOFF_SECONDS, max(1.0, float(backoff_seconds)))
                         )
-                    else:
-                        cur.execute(
-                            f"""
-                            UPDATE {self._spec.table_name}
-                            SET status = 'failed', attempts = ?, last_error = ?, leased_by = NULL, leased_until = NULL,
-                                claim_token = NULL, next_attempt_at = NULL, updated_at = ?
-                            WHERE id = ? AND generation = ? AND status = 'leased';
-                            """,
-                            (new_attempts, error_code, now_str, job_id, generation),
-                        )
-                else:
-                    backoff = min(
-                        MAX_BACKOFF_SECONDS,
-                        max(1.0, float(backoff_seconds)),
                     )
-                    next_attempt_dt = now_dt + timedelta(seconds=backoff)
-                    next_attempt_str = format_iso(next_attempt_dt) or ""
-                    if token is not None:
-                        cur.execute(
-                            f"""
-                            UPDATE {self._spec.table_name}
-                            SET status = 'pending', attempts = ?, last_error = ?, leased_by = NULL, leased_until = NULL,
-                                claim_token = NULL, next_attempt_at = ?, updated_at = ?
-                            WHERE id = ? AND generation = ? AND claim_token = ? AND status = 'leased';
-                            """,
-                            (
-                                new_attempts,
-                                error_code,
-                                next_attempt_str,
-                                now_str,
-                                job_id,
-                                generation,
-                                token,
-                            ),
-                        )
-                    else:
-                        cur.execute(
-                            f"""
-                            UPDATE {self._spec.table_name}
-                            SET status = 'pending', attempts = ?, last_error = ?, leased_by = NULL, leased_until = NULL,
-                                claim_token = NULL, next_attempt_at = ?, updated_at = ?
-                            WHERE id = ? AND generation = ? AND status = 'leased';
-                            """,
-                            (
-                                new_attempts,
-                                error_code,
-                                next_attempt_str,
-                                now_str,
-                                job_id,
-                                generation,
-                            ),
-                        )
-
-                success = cur.rowcount > 0
+                    if retry
+                    else None
+                )
+                cur.execute(
+                    f"""UPDATE {self._spec.table_name}
+                    SET status = ?, attempts = ?, last_error = ?, leased_by = NULL, leased_until = NULL,
+                        claim_token = NULL, next_attempt_at = ?, updated_at = ?
+                    WHERE {where};""",
+                    (
+                        "pending" if retry else "failed",
+                        attempts,
+                        error_code,
+                        next_at,
+                        format_iso(now),
+                        *params,
+                    ),
+                )
+                changed = cur.rowcount > 0
                 cur.execute("COMMIT;")
-                return success
-            except Exception as err:
-                try:
-                    cur.execute("ROLLBACK;")
-                except Exception:
-                    pass
-                raise err
+                return changed
+            except Exception:
+                cur.execute("ROLLBACK;")
+                raise
 
     async def defer(
         self,
@@ -865,10 +809,9 @@ class DurableQueueEngine:
         generation: int,
         delay_seconds: float | None = None,
         claim_token: str | None = None,
-        lease_token: str | None = None,
     ) -> bool:
         """Defer job to pending without burning an attempt, gated by claim token and lease validity."""
-        token = lease_token if lease_token is not None else claim_token
+        token = claim_token
         return await asyncio.to_thread(self._sync_defer, job_id, generation, delay_seconds, token)
 
     def _sync_defer(
@@ -877,51 +820,15 @@ class DurableQueueEngine:
         generation: int,
         delay_seconds: float | None = None,
         claim_token: str | None = None,
-        lease_token: str | None = None,
     ) -> bool:
-        token = lease_token if lease_token is not None else claim_token
         delay = float(delay_seconds) if delay_seconds is not None else self._retry_delay_seconds
-        now_dt = utc_now()
-        now_str = format_iso(now_dt) or ""
-        next_attempt_str = format_iso(now_dt + timedelta(seconds=delay)) or ""
-
-        with self._lock:
-            assert self._conn is not None
-            cur = self._conn.cursor()
-            cur.execute("PRAGMA synchronous = FULL;")
-            cur.execute("BEGIN IMMEDIATE;")
-            try:
-                if token is not None:
-                    cur.execute(
-                        f"""
-                        UPDATE {self._spec.table_name}
-                        SET status = 'pending', next_attempt_at = ?, leased_by = NULL, leased_until = NULL,
-                            claim_token = NULL, updated_at = ?
-                        WHERE id = ? AND generation = ? AND claim_token = ? AND status = 'leased'
-                          AND (leased_until IS NULL OR leased_until > ?);
-                        """,
-                        (next_attempt_str, now_str, job_id, generation, token, now_str),
-                    )
-                else:
-                    cur.execute(
-                        f"""
-                        UPDATE {self._spec.table_name}
-                        SET status = 'pending', next_attempt_at = ?, leased_by = NULL, leased_until = NULL,
-                            claim_token = NULL, updated_at = ?
-                        WHERE id = ? AND generation = ? AND status = 'leased'
-                          AND (leased_until IS NULL OR leased_until > ?);
-                        """,
-                        (next_attempt_str, now_str, job_id, generation, now_str),
-                    )
-                success = cur.rowcount > 0
-                cur.execute("COMMIT;")
-                return success
-            except Exception as err:
-                try:
-                    cur.execute("ROLLBACK;")
-                except Exception:
-                    pass
-                raise err
+        return self._sync_transition(
+            job_id,
+            generation,
+            claim_token,
+            "pending",
+            next_attempt_at=format_iso(utc_now() + timedelta(seconds=delay)),
+        )
 
     async def skip(
         self,
@@ -929,113 +836,28 @@ class DurableQueueEngine:
         generation: int,
         reason: str = "SKIPPED",
         claim_token: str | None = None,
-        lease_token: str | None = None,
     ) -> bool:
         """Mark job as skipped with CAS generation and claim token verification."""
-        token = lease_token if lease_token is not None else claim_token
+        token = claim_token
         return await asyncio.to_thread(self._sync_skip, job_id, generation, reason, token)
 
     def _sync_skip(
-        self,
-        job_id: int,
-        generation: int,
-        reason: str,
-        claim_token: str | None = None,
-        lease_token: str | None = None,
+        self, job_id: int, generation: int, reason: str, claim_token: str | None = None
     ) -> bool:
-        token = lease_token if lease_token is not None else claim_token
-        now_str = format_iso(utc_now()) or ""
-        with self._lock:
-            assert self._conn is not None
-            cur = self._conn.cursor()
-            cur.execute("PRAGMA synchronous = FULL;")
-            cur.execute("BEGIN IMMEDIATE;")
-            try:
-                if token is not None:
-                    cur.execute(
-                        f"""
-                        UPDATE {self._spec.table_name}
-                        SET status = 'skipped', last_error = ?, leased_by = NULL, leased_until = NULL,
-                            claim_token = NULL, updated_at = ?
-                        WHERE id = ? AND generation = ? AND claim_token = ? AND status = 'leased'
-                          AND (leased_until IS NULL OR leased_until > ?);
-                        """,
-                        (reason, now_str, job_id, generation, token, now_str),
-                    )
-                else:
-                    cur.execute(
-                        f"""
-                        UPDATE {self._spec.table_name}
-                        SET status = 'skipped', last_error = ?, leased_by = NULL, leased_until = NULL,
-                            claim_token = NULL, updated_at = ?
-                        WHERE id = ? AND generation = ? AND status IN ('pending', 'leased')
-                          AND (leased_until IS NULL OR leased_until > ?);
-                        """,
-                        (reason, now_str, job_id, generation, now_str),
-                    )
-                success = cur.rowcount > 0
-                cur.execute("COMMIT;")
-                return success
-            except Exception as err:
-                try:
-                    cur.execute("ROLLBACK;")
-                except Exception:
-                    pass
-                raise err
+        return self._sync_transition(job_id, generation, claim_token, "skipped", reason=reason)
 
     async def supersede(
         self,
         job_id: int,
         generation: int,
         claim_token: str | None = None,
-        lease_token: str | None = None,
     ) -> bool:
         """Mark job as superseded with CAS generation and claim token guard."""
-        token = lease_token if lease_token is not None else claim_token
+        token = claim_token
         return await asyncio.to_thread(self._sync_supersede, job_id, generation, token)
 
-    def _sync_supersede(
-        self,
-        job_id: int,
-        generation: int,
-        claim_token: str | None = None,
-        lease_token: str | None = None,
-    ) -> bool:
-        token = lease_token if lease_token is not None else claim_token
-        now_str = format_iso(utc_now()) or ""
-        with self._lock:
-            assert self._conn is not None
-            cur = self._conn.cursor()
-            cur.execute("PRAGMA synchronous = FULL;")
-            cur.execute("BEGIN IMMEDIATE;")
-            try:
-                if token is not None:
-                    cur.execute(
-                        f"""
-                        UPDATE {self._spec.table_name}
-                        SET status = 'superseded', leased_by = NULL, leased_until = NULL, claim_token = NULL, updated_at = ?
-                        WHERE id = ? AND generation = ? AND claim_token = ?;
-                        """,
-                        (now_str, job_id, generation, token),
-                    )
-                else:
-                    cur.execute(
-                        f"""
-                        UPDATE {self._spec.table_name}
-                        SET status = 'superseded', leased_by = NULL, leased_until = NULL, claim_token = NULL, updated_at = ?
-                        WHERE id = ? AND generation = ?;
-                        """,
-                        (now_str, job_id, generation),
-                    )
-                success = cur.rowcount > 0
-                cur.execute("COMMIT;")
-                return success
-            except Exception as err:
-                try:
-                    cur.execute("ROLLBACK;")
-                except Exception:
-                    pass
-                raise err
+    def _sync_supersede(self, job_id: int, generation: int, claim_token: str | None = None) -> bool:
+        return self._sync_transition(job_id, generation, claim_token, "superseded")
 
     async def recover_expired_leases(self, force_all: bool = False, commit: bool = True) -> int:
         """Recover expired or in-flight leases, resetting claim tokens and preserving attempts."""
@@ -1049,7 +871,6 @@ class DurableQueueEngine:
             assert self._conn is not None
             cur = self._conn.cursor()
             if commit:
-                cur.execute("PRAGMA synchronous = FULL;")
                 cur.execute("BEGIN IMMEDIATE;")
             try:
                 if force_all:
@@ -1120,10 +941,9 @@ class DurableQueueEngine:
         job_id: int,
         generation: int,
         claim_token: str | None = None,
-        lease_token: str | None = None,
     ) -> bool:
         """Verify job currency under current generation, lease validity, and claim token."""
-        token = lease_token if lease_token is not None else claim_token
+        token = claim_token
         return await asyncio.to_thread(self._sync_is_current, job_id, generation, token)
 
     def _sync_is_current(
@@ -1131,9 +951,8 @@ class DurableQueueEngine:
         job_id: int,
         generation: int,
         claim_token: str | None = None,
-        lease_token: str | None = None,
     ) -> bool:
-        token = lease_token if lease_token is not None else claim_token
+        token = claim_token
         now_str = format_iso(utc_now()) or ""
         with self._lock:
             if not self._conn:
@@ -1171,18 +990,22 @@ class DurableQueueEngine:
             cur.execute(f"SELECT * FROM {self._spec.table_name} WHERE id = ?;", (job_id,))
             return cur.fetchone()
 
-    async def get_latest_for_target(self, target_id: str) -> dict[str, Any] | None:
+    async def get_latest_for_target(
+        self, target_id: str, revision: Any = None
+    ) -> dict[str, Any] | None:
         """Fetch latest raw job row for a given target entity or incident."""
-        return await asyncio.to_thread(self._sync_get_latest_for_target, target_id)
+        return await asyncio.to_thread(self._sync_get_latest_for_target, target_id, revision)
 
-    def _sync_get_latest_for_target(self, target_id: str) -> dict[str, Any] | None:
+    def _sync_get_latest_for_target(
+        self, target_id: str, revision: Any = None
+    ) -> dict[str, Any] | None:
         with self._lock:
             if not self._conn:
                 return None
             cur = self._conn.cursor()
             cur.execute(
-                f"SELECT * FROM {self._spec.table_name} WHERE {self._spec.target_column} = ? ORDER BY id DESC LIMIT 1;",
-                (target_id,),
+                f"SELECT * FROM {self._spec.table_name} WHERE {self._spec.target_column} = ? AND (? IS NULL OR {self._spec.revision_column} = ?) ORDER BY id DESC LIMIT 1;",
+                (target_id, revision, revision),
             )
             return cur.fetchone()
 
@@ -1215,6 +1038,179 @@ class DurableQueueEngine:
                 (target_id, revision, profile_digest),
             )
             return cur.fetchone()
+
+    async def migrate_legacy_pending(self, profile_digest: str, profile_payload: str) -> int:
+        return await asyncio.to_thread(
+            self._sync_migrate_legacy_pending, profile_digest, profile_payload
+        )
+
+    def _sync_migrate_legacy_pending(
+        self, profile_digest: str, profile_payload: str | dict[str, Any]
+    ) -> int:
+        if isinstance(profile_payload, dict):
+            profile_payload = canonical_profile_json(profile_payload)
+        now_str = format_iso(utc_now()) or ""
+        with self._lock:
+            conn = self._conn
+            if not conn:
+                return 0
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE;")
+            try:
+                cur.execute(
+                    f"""
+                    SELECT DISTINCT {self._spec.target_column} AS target_id, {self._spec.revision_column} AS revision
+                    FROM {self._spec.table_name}
+                    WHERE profile_payload IS NULL AND status IN ('pending', 'leased');
+                    """
+                )
+                groups = cur.fetchall()
+                migrated_count = 0
+
+                for grp in groups:
+                    e_id = grp["target_id"]
+                    m_rev = grp["revision"]
+
+                    cur.execute(
+                        f"""
+                        SELECT id, status, is_manual, profile_payload FROM {self._spec.table_name}
+                        WHERE {self._spec.target_column} = ? AND {self._spec.revision_column} = ? AND profile_digest = ?;
+                        """,
+                        (e_id, m_rev, profile_digest),
+                    )
+                    target_row = cur.fetchone()
+                    target_existing = None
+                    if target_row:
+                        if target_row["profile_payload"] is not None or target_row[
+                            "status"
+                        ] not in (
+                            "pending",
+                            "leased",
+                        ):
+                            target_existing = target_row
+
+                    cur.execute(
+                        f"""
+                        SELECT id, status, is_manual, profile_digest FROM {self._spec.table_name}
+                        WHERE {self._spec.target_column} = ? AND {self._spec.revision_column} = ? AND profile_payload IS NULL
+                              AND status IN ('pending', 'leased')
+                        ORDER BY (profile_digest = ?) DESC, is_manual DESC, id DESC;
+                        """,
+                        (e_id, m_rev, profile_digest),
+                    )
+                    candidates = cur.fetchall()
+                    if not candidates:
+                        continue
+
+                    if target_existing:
+                        if target_existing["status"] in ("pending", "leased"):
+                            if (
+                                any(c["is_manual"] for c in candidates)
+                                and not target_existing["is_manual"]
+                            ):
+                                cur.execute(
+                                    f"UPDATE {self._spec.table_name} SET is_manual = 1, updated_at = ? WHERE id = ?;",
+                                    (now_str, target_existing["id"]),
+                                )
+                        for c in candidates:
+                            cur.execute(
+                                f"""
+                                UPDATE {self._spec.table_name}
+                                SET status = 'superseded', last_error = 'SUPERSEDED_BY_CURRENT_PROFILE',
+                                    leased_by = NULL, leased_until = NULL, updated_at = ?
+                                WHERE id = ?;
+                                """,
+                                (now_str, c["id"]),
+                            )
+                    else:
+                        winner = candidates[0]
+                        winner_is_manual = max(c["is_manual"] for c in candidates)
+                        cur.execute(
+                            f"""
+                            UPDATE {self._spec.table_name}
+                            SET profile_digest = ?, profile_payload = ?, is_manual = ?, updated_at = ?
+                            WHERE id = ?;
+                            """,
+                            (
+                                profile_digest,
+                                profile_payload,
+                                winner_is_manual,
+                                now_str,
+                                winner["id"],
+                            ),
+                        )
+                        migrated_count += 1
+
+                        for other in candidates[1:]:
+                            cur.execute(
+                                f"""
+                                UPDATE {self._spec.table_name}
+                                SET status = 'superseded', last_error = 'SUPERSEDED_BY_COALESCED_PROFILE',
+                                    leased_by = NULL, leased_until = NULL, updated_at = ?
+                                WHERE id = ?;
+                                """,
+                                (now_str, other["id"]),
+                            )
+
+                conn.commit()
+                return migrated_count
+            except Exception:
+                conn.rollback()
+                raise
+
+    async def supersede_older_revisions(self, target_id: str, revision: int) -> int:
+        def update() -> int:
+            with self._lock:
+                assert self._conn is not None
+                with self._conn:
+                    cur = self._conn.execute(
+                        f"""UPDATE {self._spec.table_name}
+                        SET status = 'superseded', leased_by = NULL, leased_until = NULL,
+                            claim_token = NULL, updated_at = ?
+                        WHERE {self._spec.target_column} = ? AND {self._spec.revision_column} < ?
+                          AND status IN ('pending', 'leased');""",
+                        (format_iso(utc_now()), target_id, revision),
+                    )
+                    return cur.rowcount
+
+        return await asyncio.to_thread(update)
+
+    async def compact_terminal(self, max_age_days: int = 7, limit: int = 500) -> int:
+        """Retain the newest outcome per target/revision as the auto-enqueue fence."""
+
+        def compact() -> int:
+            cutoff = format_iso(utc_now() - timedelta(days=max_age_days))
+            table, target, revision = (
+                self._spec.table_name,
+                self._spec.target_column,
+                self._spec.revision_column,
+            )
+            with self._lock:
+                assert self._conn is not None
+                with self._conn:
+                    cur = self._conn.execute(
+                        f"""DELETE FROM {table} WHERE id IN (
+                        SELECT old.id FROM {table} old
+                        WHERE old.status IN ('complete','skipped','failed','superseded') AND old.updated_at < ?
+                        AND EXISTS (SELECT 1 FROM {table} newer WHERE newer.{target} = old.{target}
+                            AND newer.{revision} = old.{revision} AND newer.id > old.id)
+                        ORDER BY old.id LIMIT ?
+                    );""",
+                        (cutoff, limit),
+                    )
+                    removed = cur.rowcount
+                    # Successful terminal rows are small deduplication fences; their
+                    # duplicated prompt/profile snapshot is no longer executable input.
+                    self._conn.execute(
+                        f"""UPDATE {table} SET profile_payload = NULL WHERE id IN (
+                        SELECT id FROM {table} WHERE status IN ('complete','skipped','superseded')
+                          AND updated_at < ? AND profile_payload IS NOT NULL ORDER BY id LIMIT ?
+                    );""",
+                        (cutoff, limit),
+                    )
+                    return removed
+
+        return await asyncio.to_thread(compact)
 
     async def get_stats(self) -> dict[str, int]:
         """Return counts of jobs by status."""
@@ -1261,10 +1257,9 @@ class DurableQueueEngine:
         generation: int,
         annotation_generation: int,
         claim_token: str | None = None,
-        lease_token: str | None = None,
     ) -> bool:
         """Update annotation generation with CAS generation and claim token check."""
-        token = lease_token if lease_token is not None else claim_token
+        token = claim_token
         return await asyncio.to_thread(
             self._sync_update_annotation_generation,
             job_id,
@@ -1279,14 +1274,12 @@ class DurableQueueEngine:
         generation: int,
         annotation_generation: int,
         claim_token: str | None = None,
-        lease_token: str | None = None,
     ) -> bool:
-        token = lease_token if lease_token is not None else claim_token
+        token = claim_token
         now_str = format_iso(utc_now()) or ""
         with self._lock:
             assert self._conn is not None
             cur = self._conn.cursor()
-            cur.execute("PRAGMA synchronous = FULL;")
             cur.execute("BEGIN IMMEDIATE;")
             try:
                 if token is not None:
@@ -1325,10 +1318,9 @@ class DurableQueueEngine:
         generation: int | None = None,
         last_error: str | None = None,
         claim_token: str | None = None,
-        lease_token: str | None = None,
     ) -> bool:
         """Update job status with CAS verification against expected_status, generation, and claim_token."""
-        token = lease_token if lease_token is not None else claim_token
+        token = claim_token
         return await asyncio.to_thread(
             self._sync_update_status_cas,
             job_id,
@@ -1347,14 +1339,12 @@ class DurableQueueEngine:
         generation: int | None = None,
         last_error: str | None = None,
         claim_token: str | None = None,
-        lease_token: str | None = None,
     ) -> bool:
-        token = lease_token if lease_token is not None else claim_token
+        token = claim_token
         now_str = format_iso(utc_now()) or ""
         with self._lock:
             assert self._conn is not None
             cur = self._conn.cursor()
-            cur.execute("PRAGMA synchronous = FULL;")
             cur.execute("BEGIN IMMEDIATE;")
             try:
                 where_clauses = ["id = ?", "status = ?"]
@@ -1453,7 +1443,6 @@ class DurableQueueEngine:
         with self._lock:
             assert self._conn is not None
             cur = self._conn.cursor()
-            cur.execute("PRAGMA synchronous = FULL;")
             cur.execute("BEGIN IMMEDIATE;")
             try:
                 cur.execute(
@@ -1493,7 +1482,6 @@ class DurableQueueEngine:
             if not self._conn:
                 return
             cur = self._conn.cursor()
-            cur.execute("PRAGMA synchronous = FULL;")
             cur.execute("BEGIN IMMEDIATE;")
             try:
                 cur.execute("DELETE FROM provider_cooldown WHERE id = ?;", (key,))

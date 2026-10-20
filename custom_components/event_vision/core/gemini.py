@@ -99,7 +99,9 @@ def parse_retry_after(
             if diff < 0.0:
                 return 0.0
             parsed = min(diff, effective_max)
-            _LOGGER.debug("Parsed HTTP-date Retry-After delay: %.2fs (capped to %.2fs)", diff, parsed)
+            _LOGGER.debug(
+                "Parsed HTTP-date Retry-After delay: %.2fs (capped to %.2fs)", diff, parsed
+            )
             return parsed
     except Exception:
         pass
@@ -201,9 +203,6 @@ class GeminiClient:
         if not frames:
             raise AnalysisError("NO_FRAMES", "No frames provided for analysis.", retryable=False)
 
-        url = self._build_url(model=model)
-        session = await self._get_session()
-
         # Build prompt: generic media description or overridden base prompt, optionally augmented with user instructions
         effective_base = (base_prompt or GENERIC_MEDIA_PROMPT).strip()
         if prompt_instructions and prompt_instructions.strip():
@@ -243,18 +242,19 @@ class GeminiClient:
             },
         }
 
-        # Header strictly carries key, NEVER URL parameter
-        headers = {
-            "Content-Type": "application/json",
-            "x-goog-api-key": self._api_key,
-        }
+        raw_json = await self._request(payload, timeout_seconds, model)
+        return self._parse_and_validate_response(raw_json)
 
-        effective_model = model or self._model
+    async def _request(
+        self, payload: dict[str, Any], timeout_seconds: float, model: str | None
+    ) -> dict[str, Any]:
+        """Shared authenticated transport, error classification, and usage logging."""
+        url = self._build_url(model=model)
+        session = await self._get_session()
+        headers = {"Content-Type": "application/json", "x-goog-api-key": self._api_key}
         _LOGGER.debug(
-            "Dispatching Gemini generateContent request: model=%s, frame_count=%d, prompt_chars=%d, timeout=%.1fs",
-            effective_model,
-            len(frames),
-            len(prompt_text),
+            "Dispatching Gemini generateContent request: model=%s, timeout=%.1fs",
+            model or self._model,
             timeout_seconds,
         )
         start_time = time.monotonic()
@@ -277,7 +277,7 @@ class GeminiClient:
                         usage.get("candidatesTokenCount"),
                         usage.get("totalTokenCount"),
                     )
-                    return self._parse_and_validate_response(raw_json)
+                    return raw_json
 
                 retry_after_raw = resp.headers.get("Retry-After")
                 retry_delay = parse_retry_after(retry_after_raw)
@@ -431,9 +431,6 @@ class GeminiClient:
                 retryable=False,
             )
 
-        url = self._build_url(model=model)
-        session = await self._get_session()
-
         effective_base = (fusion_prompt or DEFAULT_FUSION_PROMPT).strip()
         verify_privacy_clean(effective_base)
 
@@ -514,90 +511,8 @@ class GeminiClient:
             },
         }
 
-        headers = {
-            "Content-Type": "application/json",
-            "x-goog-api-key": self._api_key,
-        }
-
-        effective_model = model or self._model
-        _LOGGER.debug(
-            "Dispatching Gemini fusion generateContent request: model=%s, view_count=%d, frame_count=%d, timeout=%.1fs",
-            effective_model,
-            len(views),
-            total_frames,
-            timeout_seconds,
-        )
-        start_time = time.monotonic()
-        try:
-            async with session.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=timeout_seconds),
-            ) as resp:
-                latency = time.monotonic() - start_time
-                status = resp.status
-                if status == 200:
-                    raw_json = await resp.json()
-                    usage = raw_json.get("usageMetadata", {}) if isinstance(raw_json, dict) else {}
-                    _LOGGER.debug(
-                        "Gemini fusion response 200 in %.2fs: prompt_tokens=%s, candidates_tokens=%s, total_tokens=%s",
-                        latency,
-                        usage.get("promptTokenCount"),
-                        usage.get("candidatesTokenCount"),
-                        usage.get("totalTokenCount"),
-                    )
-                    return self._parse_and_validate_fusion_response(raw_json, valid_refs=valid_refs)
-
-                retry_after_raw = resp.headers.get("Retry-After")
-                retry_delay = parse_retry_after(retry_after_raw)
-                _LOGGER.debug(
-                    "Gemini fusion error response status=%d in %.2fs (retry_delay=%s)",
-                    status,
-                    latency,
-                    retry_delay,
-                )
-
-                if status == 429:
-                    raise AnalysisError(
-                        "RATE_LIMIT",
-                        "Gemini 429 rate limit exceeded",
-                        retryable=True,
-                        retry_delay=retry_delay,
-                    )
-
-                if status in (500, 502, 503, 504):
-                    raise AnalysisError(
-                        f"HTTP_{status}",
-                        f"Gemini server error {status}",
-                        retryable=True,
-                        retry_delay=retry_delay,
-                    )
-
-                if status in (400, 401, 403):
-                    raise AnalysisError(
-                        f"HTTP_{status}",
-                        f"Gemini client authentication error {status}",
-                        retryable=False,
-                    )
-
-                raise AnalysisError(
-                    f"HTTP_{status}",
-                    f"Unexpected status from Gemini: {status}",
-                    retryable=False,
-                )
-
-        except TimeoutError as err:
-            raise AnalysisError(
-                "TIMEOUT",
-                "Gemini fusion request timed out",
-                retryable=True,
-                timeout_source="provider",
-            ) from err
-        except aiohttp.ClientError as err:
-            raise AnalysisError(
-                "NETWORK_ERROR", "Network error connecting to Gemini", retryable=True
-            ) from err
+        raw_json = await self._request(payload, timeout_seconds, model)
+        return self._parse_and_validate_fusion_response(raw_json, valid_refs=valid_refs)
 
     def _parse_and_validate_fusion_response(
         self,

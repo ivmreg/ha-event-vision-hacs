@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import re
 import shutil
 from pathlib import Path
+from weakref import WeakValueDictionary
 
 from ..const import (
     DEFAULT_EXTRACTION_TIMEOUT,
@@ -74,9 +77,17 @@ def validate_image_bytes(data: bytes) -> str:
 class FrameExtractor:
     """Extracts anchored frames from verified media paths."""
 
-    def __init__(self, ffmpeg_bin: str | None = None, cache: FrameCache | None = None) -> None:
+    def __init__(
+        self,
+        ffmpeg_bin: str | None = None,
+        cache: FrameCache | None = None,
+        *,
+        batch_video: bool = True,
+    ) -> None:
         self._ffmpeg_bin = ffmpeg_bin
         self._cache = cache
+        self._batch_video = batch_video
+        self._clip_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
     @property
     def cache(self) -> FrameCache | None:
@@ -103,13 +114,16 @@ class FrameExtractor:
         offset_quality: str = "exact",
         media_revision: int = 1,
         source_fingerprint: str | None = None,
+        reuse_compatible: bool = False,
     ) -> list[ExtractedFrame]:
         """Extract validated frames from an existing media file path.
 
         Bounded to max_frames <= 16.
         """
         if not await asyncio.to_thread(media_path.is_file):
-            raise FrameExtractionError("MEDIA_UNAVAILABLE", f"Media file not found: {media_path.name}")
+            raise FrameExtractionError(
+                "MEDIA_UNAVAILABLE", f"Media file not found: {media_path.name}"
+            )
 
         max_frames = max(1, min(max_frames, MAX_FRAMES_BUDGET))
 
@@ -148,6 +162,37 @@ class FrameExtractor:
                 media_revision=media_revision,
                 source_fingerprint=source_fingerprint,
             )
+
+        if reuse_compatible and self._cache and self._cache.enabled:
+            cached = await self._cache.get_cached_anchors(source_fingerprint, media_revision)
+            requested = (
+                timestamps[:max_frames]
+                if timestamps
+                else self._calculate_anchors(duration, max_frames)
+            )
+            by_seek = {round(offset, 2): (offset, data, mime) for offset, data, mime in cached}
+            exact = [by_seek.get(round(offset, 2)) for offset in requested]
+            selected = (
+                exact
+                if all(item is not None for item in exact)
+                else (
+                    self._cache.select_compatible_subset(cached, len(requested))
+                    if len(cached) >= len(requested)
+                    else []
+                )
+            )
+            if selected:
+                return [
+                    ExtractedFrame(
+                        data=data,
+                        mime_type=mime,
+                        media_id=media_id,
+                        offset_seconds=offset,
+                        timestamp_quality=timestamp_quality,
+                        offset_quality=offset_quality,
+                    )
+                    for offset, data, mime in selected
+                ]
 
         # Video frame extraction
         return await self._extract_video_frames(
@@ -192,7 +237,9 @@ class FrameExtractor:
         try:
             raw_bytes = await asyncio.to_thread(media_path.read_bytes)
         except OSError as err:
-            raise FrameExtractionError("MEDIA_UNAVAILABLE", f"Cannot read media file: {err}") from err
+            raise FrameExtractionError(
+                "MEDIA_UNAVAILABLE", f"Cannot read media file: {err}"
+            ) from err
 
         detected_mime = await asyncio.to_thread(validate_image_bytes, raw_bytes)
 
@@ -233,7 +280,9 @@ class FrameExtractor:
         """Extract chronological frames from a video file using ffmpeg with cache and stampede guard."""
         ffmpeg_exec = await asyncio.to_thread(self._resolve_ffmpeg)
         if not ffmpeg_exec:
-            raise FrameExtractionError("FFMPEG_NOT_FOUND", "ffmpeg binary not found; failing closed")
+            raise FrameExtractionError(
+                "FFMPEG_NOT_FOUND", "ffmpeg binary not found; failing closed"
+            )
 
         if timestamps is not None:
             ts_list = timestamps[:max_frames]
@@ -241,6 +290,24 @@ class FrameExtractor:
             ts_list = self._calculate_anchors(duration=duration, max_frames=max_frames)
 
         frames: list[ExtractedFrame] = []
+
+        if (
+            self._batch_video
+            and duration
+            and duration <= 60
+            and len(ts_list) >= max(2, math.ceil(duration / 5))
+        ):
+            return await self._extract_batch(
+                ffmpeg_exec,
+                media_path,
+                ts_list,
+                timeout_seconds,
+                media_id,
+                timestamp_quality,
+                offset_quality,
+                media_revision,
+                source_fingerprint,
+            )
 
         for ts in ts_list:
             if self._cache and source_fingerprint:
@@ -278,9 +345,147 @@ class FrameExtractor:
                 )
 
         if not frames:
-            raise FrameExtractionError("FRAME_EXTRACTION_FAILED", "Failed to extract any valid frames from video")
+            raise FrameExtractionError(
+                "FRAME_EXTRACTION_FAILED", "Failed to extract any valid frames from video"
+            )
 
         return frames
+
+    async def _extract_batch(
+        self,
+        binary: str,
+        path: Path,
+        timestamps: list[float],
+        timeout: float,
+        media_id: str | None,
+        timestamp_quality: str,
+        offset_quality: str,
+        revision: int,
+        fingerprint: str | None,
+    ) -> list[ExtractedFrame]:
+        """Decode short clips once, sharing exact cached anchors across callers."""
+        key = fingerprint or str(path)
+        lock = self._clip_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._clip_locks[key] = lock
+        async with lock:
+            samples: dict[float, tuple[bytes, float]] = {}
+            missing = []
+            epoch = self._cache.epoch if self._cache else None
+            for seek in sorted(set(timestamps)):
+                cached = (
+                    await self._cache.get(self._cache.make_key(key, revision, seek))
+                    if self._cache
+                    else None
+                )
+                if cached:
+                    samples[seek] = (cached.data, cached.canonical_seek)
+                else:
+                    missing.append(seek)
+            if missing:
+                extracted = await self._run_ffmpeg_extract_batch(binary, path, missing, timeout)
+                for seek, (data, actual_offset) in extracted.items():
+                    samples[seek] = (data, actual_offset)
+                    if self._cache:
+                        await self._cache.put(
+                            self._cache.make_key(key, revision, seek),
+                            data,
+                            "image/jpeg",
+                            actual_offset,
+                            source_fingerprint=fingerprint,
+                            media_revision=revision,
+                            epoch=epoch,
+                        )
+            if not samples:
+                raise FrameExtractionError(
+                    "FRAME_EXTRACTION_FAILED", "No selected frames were decoded"
+                )
+            return [
+                ExtractedFrame(
+                    data=data,
+                    mime_type="image/jpeg",
+                    media_id=media_id,
+                    offset_seconds=offset,
+                    timestamp_quality=timestamp_quality,
+                    offset_quality=offset_quality,
+                )
+                for _seek, (data, offset) in sorted(samples.items())
+            ]
+
+    async def _run_ffmpeg_extract_batch(
+        self,
+        binary: str,
+        path: Path,
+        timestamps: list[float],
+        timeout: float,
+    ) -> dict[float, tuple[bytes, float]]:
+        # prev_selected_t ensures each threshold selects one frame. showinfo records
+        # actual source offsets; gaps/rounding never become invented exact timestamps.
+        select = "+".join(
+            f"gte(t,{seek:.6f})*if(isnan(prev_selected_t),1,lt(prev_selected_t,{seek:.6f}))"
+            for seek in timestamps
+        )
+        command = [
+            binary,
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-i",
+            str(path),
+            "-an",
+            "-sn",
+            "-vf",
+            f"select='{select}',showinfo,scale=1280:1280:force_original_aspect_ratio=decrease",
+            "-frames:v",
+            str(len(timestamps)),
+            "-fps_mode",
+            "vfr",
+            "-threads",
+            "1",
+            "-q:v",
+            "3",
+            "-f",
+            "image2pipe",
+            "pipe:1",
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if proc.returncode:
+                return {}
+            offsets = [float(value) for value in re.findall(rb"\bpts_time:([-+\d.eE]+)", stderr)]
+            frames = []
+            start = 0
+            while len(frames) < len(timestamps):
+                begin = stdout.find(JPEG_SOI, start)
+                end = stdout.find(JPEG_EOI, begin + 2) if begin >= 0 else -1
+                if end < 0:
+                    break
+                data = stdout[begin : end + 2]
+                await asyncio.to_thread(validate_image_bytes, data)
+                frames.append(data)
+                start = end + 2
+            decoded = list(zip(offsets, frames))
+            selected = {}
+            for seek in timestamps:
+                for offset, data in decoded:
+                    if offset + 1e-6 >= seek:
+                        selected[seek] = (data, offset)
+                        break
+            return selected
+        except TimeoutError:
+            return {}
+        finally:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
 
     def _calculate_anchors(self, duration: float | None, max_frames: int) -> list[float]:
         """Calculate chronological timestamps bounded <= 16 frames."""
