@@ -27,61 +27,53 @@
   "options": {
     "step": {
       "init": {
-        "title": "Event Vision Options",
-        "description": "Select a category to view or update settings.\n\nKnown Limitations:\n- Multi-camera visual fusion is experimental, disabled by default, and can issue additional Gemini requests with associated cost. It has not been live-tested on this Home Assistant installation.\n- Cross-view correspondences are uncertain hypotheses, not identity proofs.\n- Cloud responses do not block intake or capture; active analysis pins intentionally defer retention.\n- Extracted frame UTC may remain unknown without verified camera clocks.",
-        "menu_options": {
-          "general": "General (API Key, Model, Concurrency)",
-          "sampling": "Sampling (Budget, Policy, Instructions)",
-          "fusion": "Multi-Camera Fusion (Enable, Frame Budget, Instructions)",
-          "advanced": "Advanced (Timeouts, Attempts, Deadlines)",
-          "effective": "Effective Configuration (Read-only status)"
-        }
-      },
-      "general": {
-        "title": "General Settings",
-        "description": "Configure model, concurrency, and optional API key update.",
+        "title": "Event Vision Settings",
+        "description": "Saved settings: model {model_name}, {max_frames} frames per event ({sampling_policy}), fusion {fusion_state}, minimum job deadline {min_deadline}s.\n\nSave applies all settings on this page. Leave the API key blank to keep the saved key.",
         "data": {
-          "gemini_api_key": "Gemini API Key (leave blank to keep existing key)",
+          "gemini_api_key": "Gemini API Key (leave blank to keep saved key)",
           "model": "Gemini Model",
           "concurrency": "Concurrency (1-4)",
           "auto_analyze": "Automatically Analyze Finalized Events",
-          "enable_debug_logging": "Enable Diagnostic Debug Logging"
-        }
-      },
-      "sampling": {
-        "title": "Sampling Settings",
-        "description": "Configure frame extraction budget, policy, and prompt instructions.",
-        "data": {
           "max_frames": "Frame Sampling Budget (3-16)",
           "sampling_policy": "Sampling Policy",
           "prompt_instructions": "Custom Prompt Instructions (optional)"
+        },
+        "data_description": {
+          "gemini_api_key": "The saved key is never shown. Leave blank to keep it.",
+          "prompt_instructions": "Additional guidance appended to the base analysis prompt. Maximum 1000 characters.",
+          "max_frames": "Maximum frames extracted per event. Increasing this requires a longer job deadline."
+        },
+        "sections": {
+          "fusion": {
+            "name": "Multi-Camera Fusion (experimental)",
+            "data": {
+              "enable_fusion": "Enable Multi-Camera Visual Fusion",
+              "fusion_max_frames": "Fusion Frame Budget (2-16)",
+              "fusion_prompt_instructions": "Custom Fusion Instructions (optional)",
+              "fusion_job_deadline": "Fusion Job Deadline (seconds)"
+            },
+            "data_description": {
+              "enable_fusion": "Off by default. Enabling issues additional Gemini requests and incurs extra cost. Fusion results are uncertain hypotheses, not identity proofs.",
+              "fusion_job_deadline": "Must fit the fusion frame budget, provider timeout, and extraction timeout."
+            }
+          },
+          "advanced": {
+            "name": "Timeouts, Attempts & Cache",
+            "data": {
+              "job_deadline": "Job Deadline (seconds)",
+              "provider_timeout": "Provider Timeout (seconds)",
+              "extraction_timeout": "Extraction Timeout (seconds)",
+              "max_attempts": "Maximum Attempts (1-5)",
+              "frame_cache_mb": "Extracted Frame Cache Budget (MB, 0 to disable)",
+              "frame_cache_ttl": "Extracted Frame Cache TTL (seconds)",
+              "enable_debug_logging": "Enable Diagnostic Debug Logging"
+            },
+            "data_description": {
+              "job_deadline": "Must fit the frame budget, extraction timeout, and provider timeout.",
+              "frame_cache_mb": "0 disables the extracted frame cache."
+            }
+          }
         }
-      },
-      "fusion": {
-        "title": "Multi-Camera Visual Fusion",
-        "description": "Configure multi-camera visual fusion analysis across incident events.",
-        "data": {
-          "enable_fusion": "Enable Multi-Camera Visual Fusion",
-          "fusion_max_frames": "Fusion Frame Budget (2-16)",
-          "fusion_prompt_instructions": "Custom Fusion Instructions (optional)",
-          "fusion_job_deadline": "Fusion Job Deadline (seconds)"
-        }
-      },
-      "advanced": {
-        "title": "Advanced Settings",
-        "description": "Configure coupled execution deadlines, extraction timeouts, and attempt limits.",
-        "data": {
-          "job_deadline": "Job Deadline (seconds)",
-          "provider_timeout": "Provider Timeout (seconds)",
-          "extraction_timeout": "Extraction Timeout (seconds)",
-          "max_attempts": "Maximum Attempts (1-5)",
-          "frame_cache_mb": "Extracted Frame Cache Budget (MB, 0 to disable)",
-          "frame_cache_ttl": "Extracted Frame Cache TTL (seconds)"
-        }
-      },
-      "effective": {
-        "title": "Effective Configuration",
-        "description": "**Model:** {model_name}\n*{model_alias_fact}*\n\n**Base Prompt:**\n{base_prompt}\n\n**Custom Instructions:**\n{custom_instructions}\n\n**Effective Prompt:**\n{effective_prompt}\n\n**Input Limits:** {input_limits}\n\n**Budget Requirements:** {budget_requirements}\n\n**Policy Scope:** {policy_scope}\n\n**Multi-Camera Fusion:**\n{fusion_summary}\n\n**Known Limitations:**\n- Experimental visual fusion is off by default and can incur additional external API costs; not live-tested here\n- Cross-view correspondences are uncertain hypotheses with frame references, not identity proofs\n- Cloud responses do not block intake or capture; active analysis pins defer retention\n- Visual UTC timestamps depend on provider clock calibration and may remain unknown"
       }
     },
     "error": {

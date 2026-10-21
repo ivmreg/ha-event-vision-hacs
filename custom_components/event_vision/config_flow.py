@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from typing import Any
 
 try:
     import probatio as vol
 except ImportError:
     import voluptuous as vol
-from homeassistant import config_entries
+from homeassistant import config_entries, data_entry_flow
 from homeassistant.core import callback
 from homeassistant.helpers import selector
 
 from .const import (
+    CAS_CLEANUP_MARGIN_SECONDS,
     CONF_AUTO_ANALYZE,
     CONF_CONCURRENCY,
     CONF_ENABLE_DEBUG_LOGGING,
@@ -40,7 +43,6 @@ from .const import (
     DEFAULT_FRAME_CACHE_TTL,
     DEFAULT_FUSION_JOB_DEADLINE,
     DEFAULT_FUSION_MAX_FRAMES,
-    DEFAULT_FUSION_PROMPT,
     DEFAULT_FUSION_PROMPT_INSTRUCTIONS,
     DEFAULT_JOB_DEADLINE,
     DEFAULT_MAX_ATTEMPTS,
@@ -50,29 +52,8 @@ from .const import (
     DEFAULT_PROVIDER_TIMEOUT,
     DEFAULT_SAMPLING_POLICY,
     DOMAIN,
-    GENERIC_MEDIA_PROMPT,
-    MAX_ATTEMPTS_BOUND,
-    MAX_CONCURRENCY,
-    MAX_EXTRACTION_TIMEOUT,
-    MAX_FRAME_CACHE_MB,
-    MAX_FRAME_CACHE_TTL,
-    MAX_FRAMES_BUDGET,
-    MAX_FUSION_JOB_DEADLINE,
-    MAX_FUSION_MAX_FRAMES,
     MAX_FUSION_PROMPT_INSTRUCTIONS_LEN,
-    MAX_JOB_DEADLINE,
     MAX_PROMPT_INSTRUCTIONS_LEN,
-    MAX_PROVIDER_TIMEOUT,
-    MIN_ATTEMPTS,
-    MIN_CONCURRENCY,
-    MIN_EXTRACTION_TIMEOUT,
-    MIN_FRAME_CACHE_MB,
-    MIN_FRAME_CACHE_TTL,
-    MIN_FRAMES,
-    MIN_FUSION_JOB_DEADLINE,
-    MIN_FUSION_MAX_FRAMES,
-    MIN_JOB_DEADLINE,
-    MIN_PROVIDER_TIMEOUT,
     SAMPLING_POLICY_SPARSE_ANCHORS,
     SAMPLING_POLICY_TRIGGER_RELEVANT,
     VALID_SAMPLING_POLICIES,
@@ -89,11 +70,62 @@ from .core.models import (
     SPEC_MAX_FRAMES,
     SPEC_PROVIDER_TIMEOUT,
     ValidationError,
-    model_alias_info,
     validate_budget_bounds,
     validate_fusion_budget_bounds,
 )
 from .validation import number_spec_selector
+
+# Native Home Assistant form section ids. Sections are presentation only; all
+# values are stored as flat option keys, never nested under these ids.
+SECTION_FUSION = "fusion"
+SECTION_ADVANCED = "advanced"
+
+_VISION_SECTION_IDS = frozenset({SECTION_FUSION, SECTION_ADVANCED})
+
+# Map submitted fields to the section that renders them so a validation error
+# can re-open the section holding the invalid field.
+_VISION_FIELD_SECTIONS = {
+    CONF_ENABLE_FUSION: SECTION_FUSION,
+    CONF_FUSION_MAX_FRAMES: SECTION_FUSION,
+    CONF_FUSION_PROMPT_INSTRUCTIONS: SECTION_FUSION,
+    CONF_FUSION_JOB_DEADLINE: SECTION_FUSION,
+    CONF_JOB_DEADLINE: SECTION_ADVANCED,
+    CONF_PROVIDER_TIMEOUT: SECTION_ADVANCED,
+    CONF_EXTRACTION_TIMEOUT: SECTION_ADVANCED,
+    CONF_MAX_ATTEMPTS: SECTION_ADVANCED,
+    CONF_FRAME_CACHE_MB: SECTION_ADVANCED,
+    CONF_FRAME_CACHE_TTL: SECTION_ADVANCED,
+    CONF_ENABLE_DEBUG_LOGGING: SECTION_ADVANCED,
+}
+
+
+def _flatten_sections(
+    user_input: Mapping[str, Any], section_ids: frozenset[str]
+) -> dict[str, Any]:
+    """Flatten one level of native form sections into plain option keys."""
+    flat: dict[str, Any] = {}
+    for key, value in user_input.items():
+        if key in section_ids and isinstance(value, Mapping):
+            flat.update(value)
+        else:
+            flat[key] = value
+    return flat
+
+
+def _form_number(value: Any, default: Any) -> Any:
+    """Return a form default without discarding an attempted invalid value."""
+    if value is None or value == "" or isinstance(value, bool):
+        return default
+    if isinstance(value, float) and not math.isfinite(value):
+        return default
+    return value
+
+
+def _sections_with_errors(
+    errors: Mapping[str, str], field_sections: Mapping[str, str]
+) -> set[str]:
+    """Return the sections that should start expanded for the given errors."""
+    return {field_sections[field] for field in errors if field in field_sections}
 
 
 class EventVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -118,7 +150,9 @@ class EventVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
             try:
                 concurrency = int(
-                    SPEC_CONCURRENCY.validate(user_input.get(CONF_CONCURRENCY, DEFAULT_CONCURRENCY))
+                    SPEC_CONCURRENCY.validate(
+                        user_input.get(CONF_CONCURRENCY, DEFAULT_CONCURRENCY)
+                    )
                 )
             except (ValidationError, ValueError, TypeError):
                 errors[CONF_CONCURRENCY] = "invalid_concurrency"
@@ -133,7 +167,9 @@ class EventVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         CONF_GEMINI_API_KEY: api_key,
                         CONF_MODEL: model,
                         CONF_CONCURRENCY: concurrency,
-                        CONF_AUTO_ANALYZE: bool(user_input.get(CONF_AUTO_ANALYZE, DEFAULT_AUTO_ANALYZE)),
+                        CONF_AUTO_ANALYZE: bool(
+                            user_input.get(CONF_AUTO_ANALYZE, DEFAULT_AUTO_ANALYZE)
+                        ),
                         # Sensible default values for sampling and coupled advanced parameters
                         CONF_PROMPT_INSTRUCTIONS: DEFAULT_PROMPT_INSTRUCTIONS,
                         CONF_MAX_FRAMES: DEFAULT_MAX_FRAMES,
@@ -152,27 +188,30 @@ class EventVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     },
                 )
 
+        # Re-render the form with attempted values; the API key is never echoed.
+        displayed = dict(user_input) if user_input is not None else {}
         schema = vol.Schema(
             {
                 vol.Required(CONF_GEMINI_API_KEY): selector.TextSelector(
                     selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
                 ),
-                vol.Optional(CONF_MODEL, default=DEFAULT_MODEL): selector.TextSelector(
+                vol.Optional(
+                    CONF_MODEL, default=str(displayed.get(CONF_MODEL, DEFAULT_MODEL))
+                ): selector.TextSelector(
                     selector.TextSelectorConfig(type=selector.TextSelectorType.TEXT)
                 ),
-                vol.Optional(CONF_CONCURRENCY, default=DEFAULT_CONCURRENCY): (
-                    number_spec_selector(SPEC_CONCURRENCY)
-                    if number_spec_selector is not None
-                    else selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=MIN_CONCURRENCY,
-                            max=MAX_CONCURRENCY,
-                            step=1,
-                            mode=selector.NumberSelectorMode.BOX,
-                        )
-                    )
-                ),
-                vol.Optional(CONF_AUTO_ANALYZE, default=DEFAULT_AUTO_ANALYZE): selector.BooleanSelector(),
+                vol.Optional(
+                    CONF_CONCURRENCY,
+                    default=_form_number(
+                        displayed.get(CONF_CONCURRENCY), DEFAULT_CONCURRENCY
+                    ),
+                ): number_spec_selector(SPEC_CONCURRENCY),
+                vol.Optional(
+                    CONF_AUTO_ANALYZE,
+                    default=bool(
+                        displayed.get(CONF_AUTO_ANALYZE, DEFAULT_AUTO_ANALYZE)
+                    ),
+                ): selector.BooleanSelector(),
             }
         )
 
@@ -188,7 +227,7 @@ class EventVisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class EventVisionOptionsFlow(config_entries.OptionsFlow):
-    """Handle structured options flow for Event Vision."""
+    """Handle the single-form options flow for Event Vision."""
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         self._config_entry = config_entry
@@ -200,152 +239,360 @@ class EventVisionOptionsFlow(config_entries.OptionsFlow):
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
-        """Show options sub-menu."""
-        return self.async_show_menu(
-            step_id="init",
-            menu_options=["general", "sampling", "fusion", "advanced", "effective"],
-        )
-
-    async def async_step_general(
-        self, user_input: dict[str, Any] | None = None
-    ) -> config_entries.ConfigFlowResult:
-        """Manage general options: Model, Concurrency, Auto-Analyze, and API Key."""
-        errors: dict[str, str] = {}
+        """Show and atomically save every option in one form."""
         current_data = self._get_current_data()
+        errors: dict[str, str] = {}
+        submitted: dict[str, Any] = {}
 
         if user_input is not None:
-            new_api_key = str(user_input.get(CONF_GEMINI_API_KEY, "")).strip()
-            # If user left API key empty, preserve existing key
-            api_key = new_api_key if new_api_key else current_data.get(CONF_GEMINI_API_KEY, "")
+            submitted = _flatten_sections(user_input, _VISION_SECTION_IDS)
+            values: dict[str, Any] = {}
 
-            model = str(user_input.get(CONF_MODEL, current_data.get(CONF_MODEL, DEFAULT_MODEL))).strip()
+            new_api_key = str(submitted.get(CONF_GEMINI_API_KEY, "")).strip()
+            values[CONF_GEMINI_API_KEY] = new_api_key or str(
+                current_data.get(CONF_GEMINI_API_KEY, "")
+            )
+
+            model = str(
+                submitted.get(CONF_MODEL, current_data.get(CONF_MODEL, DEFAULT_MODEL))
+            ).strip()
             if not model:
                 errors[CONF_MODEL] = "invalid_model"
+            values[CONF_MODEL] = model
 
-            concurrency_raw = user_input.get(CONF_CONCURRENCY, current_data.get(CONF_CONCURRENCY, DEFAULT_CONCURRENCY))
             try:
-                concurrency = int(SPEC_CONCURRENCY.validate(concurrency_raw))
-            except (ValidationError, ValueError, TypeError):
-                errors[CONF_CONCURRENCY] = "invalid_concurrency"
-                concurrency = current_data.get(CONF_CONCURRENCY, DEFAULT_CONCURRENCY)
-
-            if not errors:
-                updated_options = {
-                    **current_data,
-                    CONF_GEMINI_API_KEY: api_key,
-                    CONF_MODEL: model,
-                    CONF_CONCURRENCY: concurrency,
-                    CONF_AUTO_ANALYZE: bool(user_input.get(CONF_AUTO_ANALYZE, current_data.get(CONF_AUTO_ANALYZE, DEFAULT_AUTO_ANALYZE))),
-                    CONF_ENABLE_DEBUG_LOGGING: bool(
-                        user_input.get(
-                            CONF_ENABLE_DEBUG_LOGGING,
-                            current_data.get(CONF_ENABLE_DEBUG_LOGGING, DEFAULT_ENABLE_DEBUG_LOGGING),
-                        )
-                    ),
-                }
-                return self.async_create_entry(title="", data=updated_options)
-
-        schema = vol.Schema(
-            {
-                vol.Optional(CONF_GEMINI_API_KEY, default=""): selector.TextSelector(
-                    selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
-                ),
-                vol.Optional(CONF_MODEL, default=current_data.get(CONF_MODEL, DEFAULT_MODEL)): selector.TextSelector(
-                    selector.TextSelectorConfig(type=selector.TextSelectorType.TEXT)
-                ),
-                vol.Optional(
-                    CONF_CONCURRENCY,
-                    default=current_data.get(CONF_CONCURRENCY, DEFAULT_CONCURRENCY),
-                ): (
-                    number_spec_selector(SPEC_CONCURRENCY)
-                    if number_spec_selector is not None
-                    else selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=MIN_CONCURRENCY,
-                            max=MAX_CONCURRENCY,
-                            step=1,
-                            mode=selector.NumberSelectorMode.BOX,
+                values[CONF_CONCURRENCY] = int(
+                    SPEC_CONCURRENCY.validate(
+                        submitted.get(
+                            CONF_CONCURRENCY,
+                            current_data.get(CONF_CONCURRENCY, DEFAULT_CONCURRENCY),
                         )
                     )
-                ),
-                vol.Optional(
+                )
+            except (ValidationError, ValueError, TypeError):
+                errors[CONF_CONCURRENCY] = "invalid_concurrency"
+
+            values[CONF_AUTO_ANALYZE] = bool(
+                submitted.get(
                     CONF_AUTO_ANALYZE,
-                    default=current_data.get(CONF_AUTO_ANALYZE, DEFAULT_AUTO_ANALYZE),
+                    current_data.get(CONF_AUTO_ANALYZE, DEFAULT_AUTO_ANALYZE),
+                )
+            )
+
+            try:
+                max_frames = int(
+                    SPEC_MAX_FRAMES.validate(
+                        submitted.get(
+                            CONF_MAX_FRAMES,
+                            current_data.get(CONF_MAX_FRAMES, DEFAULT_MAX_FRAMES),
+                        )
+                    )
+                )
+                values[CONF_MAX_FRAMES] = max_frames
+            except (ValidationError, ValueError, TypeError):
+                errors[CONF_MAX_FRAMES] = "invalid_max_frames"
+                max_frames = int(current_data.get(CONF_MAX_FRAMES, DEFAULT_MAX_FRAMES))
+
+            policy = str(
+                submitted.get(
+                    CONF_SAMPLING_POLICY,
+                    current_data.get(CONF_SAMPLING_POLICY, DEFAULT_SAMPLING_POLICY),
+                )
+            ).strip()
+            if policy not in VALID_SAMPLING_POLICIES:
+                errors[CONF_SAMPLING_POLICY] = "invalid_sampling_policy"
+            values[CONF_SAMPLING_POLICY] = policy
+
+            instructions = str(
+                submitted.get(
+                    CONF_PROMPT_INSTRUCTIONS,
+                    current_data.get(CONF_PROMPT_INSTRUCTIONS, DEFAULT_PROMPT_INSTRUCTIONS),
+                )
+            ).strip()
+            if len(instructions) > MAX_PROMPT_INSTRUCTIONS_LEN:
+                errors[CONF_PROMPT_INSTRUCTIONS] = "instructions_too_long"
+            values[CONF_PROMPT_INSTRUCTIONS] = instructions
+
+            enable_fusion = bool(
+                submitted.get(
+                    CONF_ENABLE_FUSION,
+                    current_data.get(CONF_ENABLE_FUSION, DEFAULT_ENABLE_FUSION),
+                )
+            )
+            values[CONF_ENABLE_FUSION] = enable_fusion
+
+            try:
+                fusion_max_frames = int(
+                    SPEC_FUSION_MAX_FRAMES.validate(
+                        submitted.get(
+                            CONF_FUSION_MAX_FRAMES,
+                            current_data.get(
+                                CONF_FUSION_MAX_FRAMES, DEFAULT_FUSION_MAX_FRAMES
+                            ),
+                        )
+                    )
+                )
+                values[CONF_FUSION_MAX_FRAMES] = fusion_max_frames
+            except (ValidationError, ValueError, TypeError):
+                errors[CONF_FUSION_MAX_FRAMES] = "invalid_fusion_max_frames"
+
+            fusion_instructions = str(
+                submitted.get(
+                    CONF_FUSION_PROMPT_INSTRUCTIONS,
+                    current_data.get(
+                        CONF_FUSION_PROMPT_INSTRUCTIONS,
+                        DEFAULT_FUSION_PROMPT_INSTRUCTIONS,
+                    ),
+                )
+            ).strip()
+            if len(fusion_instructions) > MAX_FUSION_PROMPT_INSTRUCTIONS_LEN:
+                errors[CONF_FUSION_PROMPT_INSTRUCTIONS] = "instructions_too_long"
+            values[CONF_FUSION_PROMPT_INSTRUCTIONS] = fusion_instructions
+
+            try:
+                fusion_deadline = float(
+                    SPEC_FUSION_JOB_DEADLINE.validate(
+                        submitted.get(
+                            CONF_FUSION_JOB_DEADLINE,
+                            current_data.get(
+                                CONF_FUSION_JOB_DEADLINE, DEFAULT_FUSION_JOB_DEADLINE
+                            ),
+                        )
+                    )
+                )
+                values[CONF_FUSION_JOB_DEADLINE] = fusion_deadline
+            except (ValidationError, ValueError, TypeError):
+                errors[CONF_FUSION_JOB_DEADLINE] = "invalid_fusion_deadline"
+
+            for field, spec, err_key in (
+                (CONF_JOB_DEADLINE, SPEC_JOB_DEADLINE, "invalid_job_deadline"),
+                (CONF_PROVIDER_TIMEOUT, SPEC_PROVIDER_TIMEOUT, "invalid_provider_timeout"),
+                (
+                    CONF_EXTRACTION_TIMEOUT,
+                    SPEC_EXTRACTION_TIMEOUT,
+                    "invalid_extraction_timeout",
+                ),
+            ):
+                try:
+                    values[field] = float(
+                        spec.validate(
+                            submitted.get(
+                                field,
+                                current_data.get(field, spec.default),
+                            )
+                        )
+                    )
+                except (ValidationError, ValueError, TypeError):
+                    errors[field] = err_key
+
+            for field, spec, err_key in (
+                (CONF_MAX_ATTEMPTS, SPEC_MAX_ATTEMPTS, "invalid_max_attempts"),
+                (CONF_FRAME_CACHE_MB, SPEC_FRAME_CACHE_MB, "invalid_frame_cache_mb"),
+            ):
+                try:
+                    values[field] = int(
+                        spec.validate(
+                            submitted.get(
+                                field,
+                                current_data.get(field, spec.default),
+                            )
+                        )
+                    )
+                except (ValidationError, ValueError, TypeError):
+                    errors[field] = err_key
+
+            try:
+                values[CONF_FRAME_CACHE_TTL] = float(
+                    SPEC_FRAME_CACHE_TTL.validate(
+                        submitted.get(
+                            CONF_FRAME_CACHE_TTL,
+                            current_data.get(
+                                CONF_FRAME_CACHE_TTL, DEFAULT_FRAME_CACHE_TTL
+                            ),
+                        )
+                    )
+                )
+            except (ValidationError, ValueError, TypeError):
+                errors[CONF_FRAME_CACHE_TTL] = "invalid_frame_cache_ttl"
+
+            values[CONF_ENABLE_DEBUG_LOGGING] = bool(
+                submitted.get(
+                    CONF_ENABLE_DEBUG_LOGGING,
+                    current_data.get(
+                        CONF_ENABLE_DEBUG_LOGGING, DEFAULT_ENABLE_DEBUG_LOGGING
+                    ),
+                )
+            )
+
+            # Coupled budgets use the newly submitted values, not the stored ones.
+            if not errors:
+                valid_budget, _ = validate_budget_bounds(
+                    job_deadline=values[CONF_JOB_DEADLINE],
+                    provider_timeout=values[CONF_PROVIDER_TIMEOUT],
+                    extraction_timeout=values[CONF_EXTRACTION_TIMEOUT],
+                    max_frames=max_frames,
+                    max_attempts=values[CONF_MAX_ATTEMPTS],
+                )
+                if not valid_budget:
+                    errors[CONF_JOB_DEADLINE] = "budget_deadline_too_short"
+                elif enable_fusion:
+                    valid_fusion_budget, _ = validate_fusion_budget_bounds(
+                        fusion_job_deadline=values[CONF_FUSION_JOB_DEADLINE],
+                        fusion_max_frames=values[CONF_FUSION_MAX_FRAMES],
+                        provider_timeout=values[CONF_PROVIDER_TIMEOUT],
+                        extraction_timeout=values[CONF_EXTRACTION_TIMEOUT],
+                    )
+                    if not valid_fusion_budget:
+                        errors[CONF_FUSION_JOB_DEADLINE] = "budget_deadline_too_short"
+
+            if not errors:
+                return self.async_create_entry(
+                    title="", data={**current_data, **values}
+                )
+
+        displayed = {**current_data, **submitted}
+        # Never echo a stored or attempted secret back into the form.
+        displayed[CONF_GEMINI_API_KEY] = ""
+        schema = self._options_schema(
+            displayed, _sections_with_errors(errors, _VISION_FIELD_SECTIONS)
+        )
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=schema,
+            errors=errors,
+            description_placeholders=self._summary_placeholders(),
+        )
+
+    @staticmethod
+    def _options_schema(displayed: Mapping[str, Any], expanded: set[str]) -> Any:
+        """Build the single options form with collapsed fusion/advanced groups."""
+        fusion = vol.Schema(
+            {
+                vol.Optional(
+                    CONF_ENABLE_FUSION,
+                    default=bool(
+                        displayed.get(CONF_ENABLE_FUSION, DEFAULT_ENABLE_FUSION)
+                    ),
                 ): selector.BooleanSelector(),
                 vol.Optional(
+                    CONF_FUSION_MAX_FRAMES,
+                    default=_form_number(
+                        displayed.get(CONF_FUSION_MAX_FRAMES),
+                        DEFAULT_FUSION_MAX_FRAMES,
+                    ),
+                ): number_spec_selector(SPEC_FUSION_MAX_FRAMES),
+                vol.Optional(
+                    CONF_FUSION_PROMPT_INSTRUCTIONS,
+                    default=str(
+                        displayed.get(
+                            CONF_FUSION_PROMPT_INSTRUCTIONS,
+                            DEFAULT_FUSION_PROMPT_INSTRUCTIONS,
+                        )
+                    ),
+                ): selector.TextSelector(selector.TextSelectorConfig(multiline=True)),
+                vol.Optional(
+                    CONF_FUSION_JOB_DEADLINE,
+                    default=_form_number(
+                        displayed.get(CONF_FUSION_JOB_DEADLINE),
+                        DEFAULT_FUSION_JOB_DEADLINE,
+                    ),
+                ): number_spec_selector(
+                    SPEC_FUSION_JOB_DEADLINE, step=10, unit_of_measurement="s"
+                ),
+            }
+        )
+        advanced = vol.Schema(
+            {
+                vol.Optional(
+                    CONF_JOB_DEADLINE,
+                    default=_form_number(
+                        displayed.get(CONF_JOB_DEADLINE), DEFAULT_JOB_DEADLINE
+                    ),
+                ): number_spec_selector(
+                    SPEC_JOB_DEADLINE, step=5, unit_of_measurement="s"
+                ),
+                vol.Optional(
+                    CONF_PROVIDER_TIMEOUT,
+                    default=_form_number(
+                        displayed.get(CONF_PROVIDER_TIMEOUT), DEFAULT_PROVIDER_TIMEOUT
+                    ),
+                ): number_spec_selector(
+                    SPEC_PROVIDER_TIMEOUT, step=5, unit_of_measurement="s"
+                ),
+                vol.Optional(
+                    CONF_EXTRACTION_TIMEOUT,
+                    default=_form_number(
+                        displayed.get(CONF_EXTRACTION_TIMEOUT),
+                        DEFAULT_EXTRACTION_TIMEOUT,
+                    ),
+                ): number_spec_selector(
+                    SPEC_EXTRACTION_TIMEOUT, step=1, unit_of_measurement="s"
+                ),
+                vol.Optional(
+                    CONF_MAX_ATTEMPTS,
+                    default=_form_number(
+                        displayed.get(CONF_MAX_ATTEMPTS), DEFAULT_MAX_ATTEMPTS
+                    ),
+                ): number_spec_selector(SPEC_MAX_ATTEMPTS),
+                vol.Optional(
+                    CONF_FRAME_CACHE_MB,
+                    default=_form_number(
+                        displayed.get(CONF_FRAME_CACHE_MB), DEFAULT_FRAME_CACHE_MB
+                    ),
+                ): number_spec_selector(
+                    SPEC_FRAME_CACHE_MB, step=8, unit_of_measurement="MB"
+                ),
+                vol.Optional(
+                    CONF_FRAME_CACHE_TTL,
+                    default=_form_number(
+                        displayed.get(CONF_FRAME_CACHE_TTL), DEFAULT_FRAME_CACHE_TTL
+                    ),
+                ): number_spec_selector(
+                    SPEC_FRAME_CACHE_TTL, step=30, unit_of_measurement="s"
+                ),
+                vol.Optional(
                     CONF_ENABLE_DEBUG_LOGGING,
-                    default=current_data.get(
-                        CONF_ENABLE_DEBUG_LOGGING, DEFAULT_ENABLE_DEBUG_LOGGING
+                    default=bool(
+                        displayed.get(
+                            CONF_ENABLE_DEBUG_LOGGING, DEFAULT_ENABLE_DEBUG_LOGGING
+                        )
                     ),
                 ): selector.BooleanSelector(),
             }
         )
 
-        return self.async_show_form(step_id="general", data_schema=schema, errors=errors)
-
-    async def async_step_sampling(
-        self, user_input: dict[str, Any] | None = None
-    ) -> config_entries.ConfigFlowResult:
-        """Manage sampling options: frame budget, policy, and prompt instructions."""
-        errors: dict[str, str] = {}
-        current_data = self._get_current_data()
-
-        if user_input is not None:
-            max_frames_raw = user_input.get(CONF_MAX_FRAMES, current_data.get(CONF_MAX_FRAMES, DEFAULT_MAX_FRAMES))
-            try:
-                max_frames = int(SPEC_MAX_FRAMES.validate(max_frames_raw))
-            except (ValidationError, ValueError, TypeError):
-                errors[CONF_MAX_FRAMES] = "invalid_max_frames"
-                max_frames = current_data.get(CONF_MAX_FRAMES, DEFAULT_MAX_FRAMES)
-
-            policy = str(user_input.get(CONF_SAMPLING_POLICY, current_data.get(CONF_SAMPLING_POLICY, DEFAULT_SAMPLING_POLICY))).strip()
-            if policy not in VALID_SAMPLING_POLICIES:
-                errors[CONF_SAMPLING_POLICY] = "invalid_sampling_policy"
-
-            instructions = str(user_input.get(CONF_PROMPT_INSTRUCTIONS, "")).strip()
-            if len(instructions) > MAX_PROMPT_INSTRUCTIONS_LEN:
-                errors[CONF_PROMPT_INSTRUCTIONS] = "instructions_too_long"
-
-            # Coupled budget check with current advanced settings
-            valid_budget, _ = validate_budget_bounds(
-                job_deadline=current_data.get(CONF_JOB_DEADLINE, DEFAULT_JOB_DEADLINE),
-                provider_timeout=current_data.get(CONF_PROVIDER_TIMEOUT, DEFAULT_PROVIDER_TIMEOUT),
-                extraction_timeout=current_data.get(CONF_EXTRACTION_TIMEOUT, DEFAULT_EXTRACTION_TIMEOUT),
-                max_frames=max_frames,
-                max_attempts=current_data.get(CONF_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS),
-            )
-            if not valid_budget:
-                errors[CONF_MAX_FRAMES] = "budget_deadline_too_short"
-
-            if not errors:
-                updated_options = {
-                    **current_data,
-                    CONF_MAX_FRAMES: max_frames,
-                    CONF_SAMPLING_POLICY: policy,
-                    CONF_PROMPT_INSTRUCTIONS: instructions,
-                }
-                return self.async_create_entry(title="", data=updated_options)
-
-        schema = vol.Schema(
+        return vol.Schema(
             {
-                vol.Optional(
-                    CONF_MAX_FRAMES,
-                    default=current_data.get(CONF_MAX_FRAMES, DEFAULT_MAX_FRAMES),
-                ): (
-                    number_spec_selector(SPEC_MAX_FRAMES)
-                    if number_spec_selector is not None
-                    else selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=MIN_FRAMES,
-                            max=MAX_FRAMES_BUDGET,
-                            step=1,
-                            mode=selector.NumberSelectorMode.BOX,
-                        )
-                    )
+                vol.Optional(CONF_GEMINI_API_KEY, default=""): selector.TextSelector(
+                    selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
                 ),
                 vol.Optional(
+                    CONF_MODEL, default=str(displayed.get(CONF_MODEL, DEFAULT_MODEL))
+                ): selector.TextSelector(
+                    selector.TextSelectorConfig(type=selector.TextSelectorType.TEXT)
+                ),
+                vol.Optional(
+                    CONF_CONCURRENCY,
+                    default=_form_number(
+                        displayed.get(CONF_CONCURRENCY), DEFAULT_CONCURRENCY
+                    ),
+                ): number_spec_selector(SPEC_CONCURRENCY),
+                vol.Optional(
+                    CONF_AUTO_ANALYZE,
+                    default=bool(displayed.get(CONF_AUTO_ANALYZE, DEFAULT_AUTO_ANALYZE)),
+                ): selector.BooleanSelector(),
+                vol.Optional(
+                    CONF_MAX_FRAMES,
+                    default=_form_number(
+                        displayed.get(CONF_MAX_FRAMES), DEFAULT_MAX_FRAMES
+                    ),
+                ): number_spec_selector(SPEC_MAX_FRAMES),
+                vol.Optional(
                     CONF_SAMPLING_POLICY,
-                    default=current_data.get(CONF_SAMPLING_POLICY, DEFAULT_SAMPLING_POLICY),
+                    default=str(
+                        displayed.get(CONF_SAMPLING_POLICY, DEFAULT_SAMPLING_POLICY)
+                    ),
                 ): selector.SelectSelector(
                     selector.SelectSelectorConfig(
                         options=[
@@ -363,363 +610,52 @@ class EventVisionOptionsFlow(config_entries.OptionsFlow):
                 ),
                 vol.Optional(
                     CONF_PROMPT_INSTRUCTIONS,
-                    default=current_data.get(CONF_PROMPT_INSTRUCTIONS, DEFAULT_PROMPT_INSTRUCTIONS),
-                ): selector.TextSelector(selector.TextSelectorConfig(multiline=True)),
-            }
-        )
-
-        return self.async_show_form(step_id="sampling", data_schema=schema, errors=errors)
-
-    async def async_step_fusion(
-        self, user_input: dict[str, Any] | None = None
-    ) -> config_entries.ConfigFlowResult:
-        """Manage multi-camera visual fusion options."""
-        errors: dict[str, str] = {}
-        current_data = self._get_current_data()
-
-        if user_input is not None:
-            enable_fusion = bool(user_input.get(CONF_ENABLE_FUSION, DEFAULT_ENABLE_FUSION))
-
-            raw_max_frames = user_input.get(
-                CONF_FUSION_MAX_FRAMES,
-                current_data.get(CONF_FUSION_MAX_FRAMES, DEFAULT_FUSION_MAX_FRAMES),
-            )
-            try:
-                fusion_max_frames = int(SPEC_FUSION_MAX_FRAMES.validate(raw_max_frames))
-            except (ValidationError, ValueError, TypeError):
-                errors[CONF_FUSION_MAX_FRAMES] = "invalid_fusion_max_frames"
-                fusion_max_frames = current_data.get(CONF_FUSION_MAX_FRAMES, DEFAULT_FUSION_MAX_FRAMES)
-
-            instructions = str(user_input.get(CONF_FUSION_PROMPT_INSTRUCTIONS, "")).strip()
-            if len(instructions) > MAX_FUSION_PROMPT_INSTRUCTIONS_LEN:
-                errors[CONF_FUSION_PROMPT_INSTRUCTIONS] = "instructions_too_long"
-
-            raw_deadline = user_input.get(
-                CONF_FUSION_JOB_DEADLINE,
-                current_data.get(CONF_FUSION_JOB_DEADLINE, DEFAULT_FUSION_JOB_DEADLINE),
-            )
-            try:
-                fusion_deadline = float(SPEC_FUSION_JOB_DEADLINE.validate(raw_deadline))
-            except (ValidationError, ValueError, TypeError):
-                errors[CONF_FUSION_JOB_DEADLINE] = "invalid_fusion_deadline"
-                fusion_deadline = current_data.get(CONF_FUSION_JOB_DEADLINE, DEFAULT_FUSION_JOB_DEADLINE)
-
-            if not errors:
-                valid_fbudget, _ = validate_fusion_budget_bounds(
-                    fusion_job_deadline=fusion_deadline,
-                    fusion_max_frames=fusion_max_frames,
-                    provider_timeout=current_data.get(CONF_PROVIDER_TIMEOUT, DEFAULT_PROVIDER_TIMEOUT),
-                    extraction_timeout=current_data.get(CONF_EXTRACTION_TIMEOUT, DEFAULT_EXTRACTION_TIMEOUT),
-                )
-                if not valid_fbudget:
-                    errors[CONF_FUSION_JOB_DEADLINE] = "budget_deadline_too_short"
-
-            if not errors:
-                updated_options = {
-                    **current_data,
-                    CONF_ENABLE_FUSION: enable_fusion,
-                    CONF_FUSION_MAX_FRAMES: fusion_max_frames,
-                    CONF_FUSION_PROMPT_INSTRUCTIONS: instructions,
-                    CONF_FUSION_JOB_DEADLINE: fusion_deadline,
-                }
-                return self.async_create_entry(title="", data=updated_options)
-
-        schema = vol.Schema(
-            {
-                vol.Optional(
-                    CONF_ENABLE_FUSION,
-                    default=current_data.get(CONF_ENABLE_FUSION, DEFAULT_ENABLE_FUSION),
-                ): selector.BooleanSelector(),
-                vol.Optional(
-                    CONF_FUSION_MAX_FRAMES,
-                    default=current_data.get(CONF_FUSION_MAX_FRAMES, DEFAULT_FUSION_MAX_FRAMES),
-                ): (
-                    number_spec_selector(SPEC_FUSION_MAX_FRAMES)
-                    if number_spec_selector is not None
-                    else selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=MIN_FUSION_MAX_FRAMES,
-                            max=MAX_FUSION_MAX_FRAMES,
-                            step=1,
-                            mode=selector.NumberSelectorMode.BOX,
+                    default=str(
+                        displayed.get(
+                            CONF_PROMPT_INSTRUCTIONS, DEFAULT_PROMPT_INSTRUCTIONS
                         )
-                    )
-                ),
-                vol.Optional(
-                    CONF_FUSION_PROMPT_INSTRUCTIONS,
-                    default=current_data.get(
-                        CONF_FUSION_PROMPT_INSTRUCTIONS, DEFAULT_FUSION_PROMPT_INSTRUCTIONS
                     ),
                 ): selector.TextSelector(selector.TextSelectorConfig(multiline=True)),
-                vol.Optional(
-                    CONF_FUSION_JOB_DEADLINE,
-                    default=current_data.get(CONF_FUSION_JOB_DEADLINE, DEFAULT_FUSION_JOB_DEADLINE),
-                ): (
-                    number_spec_selector(SPEC_FUSION_JOB_DEADLINE, step=10, unit_of_measurement="s")
-                    if number_spec_selector is not None
-                    else selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=MIN_FUSION_JOB_DEADLINE,
-                            max=MAX_FUSION_JOB_DEADLINE,
-                            step=10,
-                            unit_of_measurement="s",
-                            mode=selector.NumberSelectorMode.BOX,
-                        )
-                    )
+                vol.Required(SECTION_FUSION): data_entry_flow.section(
+                    fusion, {"collapsed": SECTION_FUSION not in expanded}
+                ),
+                vol.Required(SECTION_ADVANCED): data_entry_flow.section(
+                    advanced, {"collapsed": SECTION_ADVANCED not in expanded}
                 ),
             }
         )
 
-        return self.async_show_form(step_id="fusion", data_schema=schema, errors=errors)
-
-    async def async_step_advanced(
-        self, user_input: dict[str, Any] | None = None
-    ) -> config_entries.ConfigFlowResult:
-        """Manage coupled execution timeouts and attempt bounds."""
-        errors: dict[str, str] = {}
-        current_data = self._get_current_data()
-
-        if user_input is not None:
-            raw_deadline = user_input.get(CONF_JOB_DEADLINE, current_data.get(CONF_JOB_DEADLINE, DEFAULT_JOB_DEADLINE))
-            raw_provider = user_input.get(CONF_PROVIDER_TIMEOUT, current_data.get(CONF_PROVIDER_TIMEOUT, DEFAULT_PROVIDER_TIMEOUT))
-            raw_extraction = user_input.get(CONF_EXTRACTION_TIMEOUT, current_data.get(CONF_EXTRACTION_TIMEOUT, DEFAULT_EXTRACTION_TIMEOUT))
-            raw_attempts = user_input.get(CONF_MAX_ATTEMPTS, current_data.get(CONF_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS))
-            raw_cache_mb = user_input.get(CONF_FRAME_CACHE_MB, current_data.get(CONF_FRAME_CACHE_MB, DEFAULT_FRAME_CACHE_MB))
-            raw_cache_ttl = user_input.get(CONF_FRAME_CACHE_TTL, current_data.get(CONF_FRAME_CACHE_TTL, DEFAULT_FRAME_CACHE_TTL))
-            current_max_frames = current_data.get(CONF_MAX_FRAMES, DEFAULT_MAX_FRAMES)
-
-            deadline = current_data.get(CONF_JOB_DEADLINE, DEFAULT_JOB_DEADLINE)
-            provider_timeout = current_data.get(CONF_PROVIDER_TIMEOUT, DEFAULT_PROVIDER_TIMEOUT)
-            extraction_timeout = current_data.get(CONF_EXTRACTION_TIMEOUT, DEFAULT_EXTRACTION_TIMEOUT)
-            attempts = current_data.get(CONF_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS)
-            cache_mb = current_data.get(CONF_FRAME_CACHE_MB, DEFAULT_FRAME_CACHE_MB)
-            cache_ttl = current_data.get(CONF_FRAME_CACHE_TTL, DEFAULT_FRAME_CACHE_TTL)
-
-            try:
-                deadline = float(SPEC_JOB_DEADLINE.validate(raw_deadline))
-            except (ValidationError, ValueError, TypeError):
-                errors[CONF_JOB_DEADLINE] = "invalid_job_deadline"
-
-            try:
-                provider_timeout = float(SPEC_PROVIDER_TIMEOUT.validate(raw_provider))
-            except (ValidationError, ValueError, TypeError):
-                errors[CONF_PROVIDER_TIMEOUT] = "invalid_provider_timeout"
-
-            try:
-                extraction_timeout = float(SPEC_EXTRACTION_TIMEOUT.validate(raw_extraction))
-            except (ValidationError, ValueError, TypeError):
-                errors[CONF_EXTRACTION_TIMEOUT] = "invalid_extraction_timeout"
-
-            try:
-                attempts = int(SPEC_MAX_ATTEMPTS.validate(raw_attempts))
-            except (ValidationError, ValueError, TypeError):
-                errors[CONF_MAX_ATTEMPTS] = "invalid_max_attempts"
-
-            try:
-                cache_mb = int(SPEC_FRAME_CACHE_MB.validate(raw_cache_mb))
-            except (ValidationError, ValueError, TypeError):
-                errors[CONF_FRAME_CACHE_MB] = "invalid_frame_cache_mb"
-
-            try:
-                cache_ttl = float(SPEC_FRAME_CACHE_TTL.validate(raw_cache_ttl))
-            except (ValidationError, ValueError, TypeError):
-                errors[CONF_FRAME_CACHE_TTL] = "invalid_frame_cache_ttl"
-
-            # Check coupled budget only if individual bounds are valid
-            if not errors:
-                valid_budget, _ = validate_budget_bounds(
-                    job_deadline=deadline,
-                    provider_timeout=provider_timeout,
-                    extraction_timeout=extraction_timeout,
-                    max_frames=int(current_max_frames),
-                    max_attempts=int(attempts),
-                )
-                if not valid_budget:
-                    errors[CONF_JOB_DEADLINE] = "budget_deadline_too_short"
-
-                if current_data.get(CONF_ENABLE_FUSION, DEFAULT_ENABLE_FUSION):
-                    valid_fbudget, _ = validate_fusion_budget_bounds(
-                        fusion_job_deadline=current_data.get(CONF_FUSION_JOB_DEADLINE, DEFAULT_FUSION_JOB_DEADLINE),
-                        fusion_max_frames=current_data.get(CONF_FUSION_MAX_FRAMES, DEFAULT_FUSION_MAX_FRAMES),
-                        provider_timeout=provider_timeout,
-                        extraction_timeout=extraction_timeout,
-                    )
-                    if not valid_fbudget:
-                        errors[CONF_JOB_DEADLINE] = "budget_deadline_too_short"
-
-            if not errors:
-                updated_options = {
-                    **current_data,
-                    CONF_JOB_DEADLINE: deadline,
-                    CONF_PROVIDER_TIMEOUT: provider_timeout,
-                    CONF_EXTRACTION_TIMEOUT: extraction_timeout,
-                    CONF_MAX_ATTEMPTS: attempts,
-                    CONF_FRAME_CACHE_MB: cache_mb,
-                    CONF_FRAME_CACHE_TTL: cache_ttl,
-                }
-                return self.async_create_entry(title="", data=updated_options)
-
-        schema = vol.Schema(
-            {
-                vol.Optional(
-                    CONF_JOB_DEADLINE,
-                    default=current_data.get(CONF_JOB_DEADLINE, DEFAULT_JOB_DEADLINE),
-                ): (
-                    number_spec_selector(SPEC_JOB_DEADLINE, step=5, unit_of_measurement="s")
-                    if number_spec_selector is not None
-                    else selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=MIN_JOB_DEADLINE,
-                            max=MAX_JOB_DEADLINE,
-                            step=5,
-                            unit_of_measurement="s",
-                            mode=selector.NumberSelectorMode.BOX,
-                        )
-                    )
-                ),
-                vol.Optional(
-                    CONF_PROVIDER_TIMEOUT,
-                    default=current_data.get(CONF_PROVIDER_TIMEOUT, DEFAULT_PROVIDER_TIMEOUT),
-                ): (
-                    number_spec_selector(SPEC_PROVIDER_TIMEOUT, step=5, unit_of_measurement="s")
-                    if number_spec_selector is not None
-                    else selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=MIN_PROVIDER_TIMEOUT,
-                            max=MAX_PROVIDER_TIMEOUT,
-                            step=5,
-                            unit_of_measurement="s",
-                            mode=selector.NumberSelectorMode.BOX,
-                        )
-                    )
-                ),
-                vol.Optional(
-                    CONF_EXTRACTION_TIMEOUT,
-                    default=current_data.get(CONF_EXTRACTION_TIMEOUT, DEFAULT_EXTRACTION_TIMEOUT),
-                ): (
-                    number_spec_selector(SPEC_EXTRACTION_TIMEOUT, step=1, unit_of_measurement="s")
-                    if number_spec_selector is not None
-                    else selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=MIN_EXTRACTION_TIMEOUT,
-                            max=MAX_EXTRACTION_TIMEOUT,
-                            step=1,
-                            unit_of_measurement="s",
-                            mode=selector.NumberSelectorMode.BOX,
-                        )
-                    )
-                ),
-                vol.Optional(
-                    CONF_MAX_ATTEMPTS,
-                    default=current_data.get(CONF_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS),
-                ): (
-                    number_spec_selector(SPEC_MAX_ATTEMPTS)
-                    if number_spec_selector is not None
-                    else selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=MIN_ATTEMPTS,
-                            max=MAX_ATTEMPTS_BOUND,
-                            step=1,
-                            mode=selector.NumberSelectorMode.BOX,
-                        )
-                    )
-                ),
-                vol.Optional(
-                    CONF_FRAME_CACHE_MB,
-                    default=current_data.get(CONF_FRAME_CACHE_MB, DEFAULT_FRAME_CACHE_MB),
-                ): (
-                    number_spec_selector(SPEC_FRAME_CACHE_MB, step=8, unit_of_measurement="MB")
-                    if number_spec_selector is not None
-                    else selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=MIN_FRAME_CACHE_MB,
-                            max=MAX_FRAME_CACHE_MB,
-                            step=8,
-                            unit_of_measurement="MB",
-                            mode=selector.NumberSelectorMode.BOX,
-                        )
-                    )
-                ),
-                vol.Optional(
-                    CONF_FRAME_CACHE_TTL,
-                    default=current_data.get(CONF_FRAME_CACHE_TTL, DEFAULT_FRAME_CACHE_TTL),
-                ): (
-                    number_spec_selector(SPEC_FRAME_CACHE_TTL, step=30, unit_of_measurement="s")
-                    if number_spec_selector is not None
-                    else selector.NumberSelector(
-                        selector.NumberSelectorConfig(
-                            min=MIN_FRAME_CACHE_TTL,
-                            max=MAX_FRAME_CACHE_TTL,
-                            step=30,
-                            unit_of_measurement="s",
-                            mode=selector.NumberSelectorMode.BOX,
-                        )
-                    )
-                ),
-            }
-        )
-
-        return self.async_show_form(step_id="advanced", data_schema=schema, errors=errors)
-
-    async def async_step_effective(
-        self, user_input: dict[str, Any] | None = None
-    ) -> config_entries.ConfigFlowResult:
-        """Show read-only effective configuration, prompt compositions, and budget limits."""
-        if user_input is not None:
-            return self.async_create_entry(title="", data=self._get_current_data())
-
+    def _summary_placeholders(self) -> dict[str, str]:
+        """Return a concise, secret-free summary for the form description."""
         current_data = self._get_current_data()
         model = str(current_data.get(CONF_MODEL, DEFAULT_MODEL)).strip()
-        custom_instructions = str(current_data.get(CONF_PROMPT_INSTRUCTIONS, "")).strip()
         max_frames = int(current_data.get(CONF_MAX_FRAMES, DEFAULT_MAX_FRAMES))
-        ext_timeout = float(current_data.get(CONF_EXTRACTION_TIMEOUT, DEFAULT_EXTRACTION_TIMEOUT))
-        prov_timeout = float(current_data.get(CONF_PROVIDER_TIMEOUT, DEFAULT_PROVIDER_TIMEOUT))
-        deadline = float(current_data.get(CONF_JOB_DEADLINE, DEFAULT_JOB_DEADLINE))
-
-        # Effective prompt composition
-        effective_prompt = GENERIC_MEDIA_PROMPT
-        if custom_instructions:
-            effective_prompt += f"\nAdditional Instructions: {custom_instructions}"
-
-        alias_info = model_alias_info(model)
-
-        min_req = (max_frames * ext_timeout) + prov_timeout + 10.0
-        budget_summary = (
-            f"Configured: {deadline:.1f}s | Minimum Required: {min_req:.1f}s "
-            f"({max_frames} frames * {ext_timeout:.1f}s + {prov_timeout:.1f}s prov + 10.0s CAS)"
+        policy = str(current_data.get(CONF_SAMPLING_POLICY, DEFAULT_SAMPLING_POLICY))
+        fusion_enabled = bool(
+            current_data.get(CONF_ENABLE_FUSION, DEFAULT_ENABLE_FUSION)
         )
-
-        # Fusion effective summary
-        fusion_enabled = bool(current_data.get(CONF_ENABLE_FUSION, DEFAULT_ENABLE_FUSION))
-        fusion_frames = int(current_data.get(CONF_FUSION_MAX_FRAMES, DEFAULT_FUSION_MAX_FRAMES))
-        fusion_inst = str(current_data.get(CONF_FUSION_PROMPT_INSTRUCTIONS, "")).strip()
-        fusion_dead = float(current_data.get(CONF_FUSION_JOB_DEADLINE, DEFAULT_FUSION_JOB_DEADLINE))
-        effective_fusion_prompt = DEFAULT_FUSION_PROMPT
-        if fusion_inst:
-            effective_fusion_prompt += f"\nAdditional Instructions: {fusion_inst}"
-
-        fusion_summary = (
-            f"Enabled: {fusion_enabled} | Frame Budget: {fusion_frames} | Deadline: {fusion_dead:.1f}s\n"
-            f"Effective Fusion Prompt:\n{effective_fusion_prompt}"
+        fusion_state = (
+            "enabled ({frames} frames, {deadline:.1f}s deadline)".format(
+                frames=int(
+                    current_data.get(CONF_FUSION_MAX_FRAMES, DEFAULT_FUSION_MAX_FRAMES)
+                ),
+                deadline=float(
+                    current_data.get(CONF_FUSION_JOB_DEADLINE, DEFAULT_FUSION_JOB_DEADLINE)
+                ),
+            )
+            if fusion_enabled
+            else "disabled"
         )
-
-        placeholders = {
+        min_deadline = (
+            max_frames
+            * float(current_data.get(CONF_EXTRACTION_TIMEOUT, DEFAULT_EXTRACTION_TIMEOUT))
+            + float(current_data.get(CONF_PROVIDER_TIMEOUT, DEFAULT_PROVIDER_TIMEOUT))
+            + CAS_CLEANUP_MARGIN_SECONDS
+        )
+        return {
             "model_name": model,
-            "model_alias_fact": alias_info,
-            "base_prompt": GENERIC_MEDIA_PROMPT,
-            "custom_instructions": custom_instructions or "(None configured)",
-            "effective_prompt": effective_prompt,
-            "fusion_summary": fusion_summary,
-            "input_limits": "10 MB per file, max 4096px dimension",
-            "budget_requirements": budget_summary,
-            "policy_scope": (
-                "Settings apply to future events and explicit manual reanalysis only. "
-                "Historical completed and skipped records remain untouched."
-            ),
+            "max_frames": str(max_frames),
+            "sampling_policy": policy,
+            "fusion_state": fusion_state,
+            "min_deadline": f"{min_deadline:.1f}",
         }
-
-        return self.async_show_form(
-            step_id="effective",
-            data_schema=vol.Schema({}),
-            description_placeholders=placeholders,
-        )

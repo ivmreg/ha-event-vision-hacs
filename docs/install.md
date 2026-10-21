@@ -19,13 +19,13 @@ Manual copy into `custom_components/` remains supported.
 
 > [!IMPORTANT]
 > **Version Dependency & HACS Upgrade Order:**
-> `event_vision 0.4.0` requires `event_recording >= 0.5.0` for shared declarative validation modules.
+> `event_vision 0.5.1` requires `event_recording` (declared dependency) for shared declarative validation modules.
 > When updating in HACS, operators must update both **Event Recording** and **Event Vision** before restarting Home Assistant.
 
 | Component | Role | Required Dependencies | Cloud / API Key |
 |---|---|---|---|
-| **`event_recording` (0.5.0)** | Standalone event journal, media store, streaming, card | None (works standalone) | None (100% local) |
-| **`event_vision` (0.4.0)** | Optional AI incident analyzer | `event_recording >= 0.5.0` | Google Gemini API key |
+| **`event_recording` (0.7.3)** | Standalone event journal, media store, streaming, card | None (works standalone) | None (100% local) |
+| **`event_vision` (0.5.1)** | Optional AI incident analyzer | `event_recording` (install first) | Google Gemini API key |
 
 ---
 
@@ -50,7 +50,15 @@ Manual copy into `custom_components/` remains supported.
 
 ### Configure camera profiles later
 
-After setup, open **Settings -> Devices & Services -> Event Recording -> Configure** to add, edit, or remove camera profiles under **Cameras**. Each profile selects an existing Home Assistant `camera` entity and sets its `source_id`, `label`, `window_seconds` (1–300), `lookback_seconds` (0–60), `chunk_seconds` (1–15), and `max_window_seconds` (1–300; at least `window_seconds`). Camera credentials and connection settings remain with the camera's existing Home Assistant integration.
+After setup, open **Settings -> Devices & Services -> Event Recording -> Configure**. The menu contains:
+
+- **Settings** — saves storage retention, go2rtc connection, queue/advanced, and correlation values in one atomic step. The media root is fixed at setup and shown read-only.
+- **Add Camera Profile** — one form: select an existing Home Assistant `camera` entity and optionally set `source_id`, `label`, `window_seconds` (1–300), `lookback_seconds` (0–60), `chunk_seconds` (1–15), and `max_window_seconds` (1–300; at least `window_seconds`). Omitted `source_id` or `label` values are inferred from the entity; new profiles inherit the current global timing defaults.
+- **Edit Camera Profile** — select a camera, then edit the same single form pre-filled.
+- **Remove Camera Profile** — asks for explicit confirmation.
+- **Configuration Summary (Read-only)** — displays the effective configuration and saves nothing.
+
+Camera credentials and connection settings remain with the camera's existing Home Assistant integration.
 
 Profiles are optional and stored under `entry.options.camera_profiles`, keyed by camera entity ID. Adding or editing a profile sets defaults for future recording sessions; it does not interrupt or reconfigure an active episode. Removing a profile removes only its settings and leaves recordings intact. The `camera_entity` shortcut on `event_recording.record` requires a configured profile. Existing automations that pass `resource_key` and `recorder_config` remain supported.
 
@@ -92,7 +100,7 @@ Validate configuration and restart after this manual change. Use your actual con
 1. In Home Assistant, navigate to **Settings -> Dashboards -> Resources** (or menu dots in Lovelace UI -> Manage resources).
 2. Click **Add Resource**.
 3. Fill in the resource details:
-   - **URL:** `/event_recording/event-card.js`
+   - **URL:** `/event_recording/event-card.js?v=0.7.3`
    - **Resource Type:** `JavaScript Module`
 4. Click **Create**.
 5. You can now add the card to any Lovelace view:
@@ -100,6 +108,9 @@ Validate configuration and restart after this manual change. Use your actual con
    type: custom:event-recording-card
    page_size: 25
    ```
+
+> [!TIP]
+> Keep the `?v=` suffix in sync with the installed integration version (currently `0.7.3`). Changing it after a HACS upgrade makes browsers fetch the new module instead of a cached one.
 
 ---
 
@@ -118,6 +129,8 @@ If you wish to enable multimodal AI event analysis via direct Google Gemini:
    - **Gemini API Key:** Your Google AI Studio API key.
    - **Gemini Model:** Multimodal model ID (default: `gemini-flash-lite-latest`).
 6. Click **Submit**.
+
+To change settings later, open **Settings -> Devices & Services -> Event Vision -> Configure**. One form edits the model, concurrency, auto-analyze, sampling, fusion, and advanced timing values together and saves them atomically. The API key field is masked; leave it blank to keep the saved key. The form description summarizes the saved settings and the minimum job deadline implied by the current timeouts.
 
 > [!NOTE]
 > **Secret Storage Notice:** Home Assistant persists configuration entries on disk in `.storage/core.config_entries` as plaintext JSON. Keys are redacted in diagnostics and logging, but are not encrypted at rest by the Home Assistant platform.
