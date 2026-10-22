@@ -19,13 +19,14 @@ Manual copy into `custom_components/` remains supported.
 
 > [!IMPORTANT]
 > **Version Dependency & HACS Upgrade Order:**
-> `event_vision 0.5.1` requires `event_recording` (declared dependency) for shared declarative validation modules.
-> When updating in HACS, operators must update both **Event Recording** and **Event Vision** before restarting Home Assistant.
+> `event_vision 0.5.2` declares `event_recording` as a dependency for shared declarative validation modules, so Recording must be installed before Vision.
+> Only when both components need an upgrade in the same HACS pass, update **Event Recording** before **Event Vision**, then restart Home Assistant once.
+> A Recording-only update such as the 0.7.8 provenance update needs no Event Vision reinstall and no analyzer changes; existing Event Vision installations keep working unchanged.
 
 | Component | Role | Required Dependencies | Cloud / API Key |
 |---|---|---|---|
-| **`event_recording` (0.7.3)** | Standalone event journal, media store, streaming, card | None (works standalone) | None (100% local) |
-| **`event_vision` (0.5.1)** | Optional AI incident analyzer | `event_recording` (install first) | Google Gemini API key |
+| **`event_recording` (0.7.8)** | Standalone event journal, media store, streaming, card | None (works standalone) | None (100% local) |
+| **`event_vision` (0.5.2)** | Optional AI incident analyzer | `event_recording` (install first) | Google Gemini API key |
 
 ---
 
@@ -50,13 +51,13 @@ Manual copy into `custom_components/` remains supported.
 
 ### Configure camera profiles later
 
-After setup, open **Settings -> Devices & Services -> Event Recording -> Configure**. The menu contains:
+After setup, open **Settings -> Devices & Services -> Event Recording -> Configure**. Configure opens a single settings page directly; there is no menu and no separate camera wizard:
 
-- **Settings** — saves storage retention, go2rtc connection, queue/advanced, and correlation values in one atomic step. The media root is fixed at setup and shown read-only.
-- **Add Camera Profile** — one form: select an existing Home Assistant `camera` entity and optionally set `source_id`, `label`, `window_seconds` (1–300), `lookback_seconds` (0–60), `chunk_seconds` (1–15), and `max_window_seconds` (1–300; at least `window_seconds`). Omitted `source_id` or `label` values are inferred from the entity; new profiles inherit the current global timing defaults.
-- **Edit Camera Profile** — select a camera, then edit the same single form pre-filled.
-- **Remove Camera Profile** — asks for explicit confirmation.
-- **Configuration Summary (Read-only)** — displays the effective configuration and saves nothing.
+- **Settings page** — storage retention, go2rtc connection, queue/advanced, and correlation values sit together with the camera profile list and are saved in one atomic step. The media root is fixed at setup and shown read-only.
+- **Camera profile list** — one row per camera, using the list's native **Add**, **Edit**, and **Delete** controls. A row edits `source_id`, `label`, `window_seconds` (1–300), `lookback_seconds` (0–60), `chunk_seconds` (1–15), and `max_window_seconds` (1–300; at least `window_seconds`), plus the provider and correlation fields. For a new camera, blank `source_id` or `label` values are inferred from the entity and the row starts from the current global timing defaults.
+- **One Save** — a single Save writes the global settings and every camera row together. Removing a camera profile, or changing a row's camera entity, is applied only after the explicit removal confirmation shown on the same page.
+
+Camera rows are identified by their camera entity. Changing a row's camera entity replaces that profile: the new entity starts fresh and does not inherit the previous camera's saved Frigate token or extra stored settings. Leave the token blank to keep the token saved for that same camera, or tick the clear box to remove it.
 
 Camera credentials and connection settings remain with the camera's existing Home Assistant integration.
 
@@ -100,7 +101,7 @@ Validate configuration and restart after this manual change. Use your actual con
 1. In Home Assistant, navigate to **Settings -> Dashboards -> Resources** (or menu dots in Lovelace UI -> Manage resources).
 2. Click **Add Resource**.
 3. Fill in the resource details:
-   - **URL:** `/event_recording/event-card.js?v=0.7.3`
+   - **URL:** `/event_recording/event-card.js?v=0.7.8`
    - **Resource Type:** `JavaScript Module`
 4. Click **Create**.
 5. You can now add the card to any Lovelace view:
@@ -110,7 +111,7 @@ Validate configuration and restart after this manual change. Use your actual con
    ```
 
 > [!TIP]
-> Keep the `?v=` suffix in sync with the installed integration version (currently `0.7.3`). Changing it after a HACS upgrade makes browsers fetch the new module instead of a cached one.
+> Keep the `?v=` suffix in sync with the installed integration version (currently `0.7.8`). Changing it after a HACS upgrade makes browsers fetch the new module instead of a cached one.
 
 ---
 

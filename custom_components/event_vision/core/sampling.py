@@ -28,6 +28,13 @@ from ..const import (
     VALID_SAMPLING_POLICIES,
 )
 
+#: Clock origins whose wall-clock timestamps may anchor a media item. The
+#: recorder's producer-specific sources are host/provider observations, while
+#: camera PTS and unknown origins stay untrusted.
+_TRUSTED_CLOCK_SOURCES = frozenset(
+    {"ntp", "ptp", "wall_clock", "ha_stream", "go2rtc", "frigate_nvr"}
+)
+
 
 @dataclass(frozen=True)
 class PlannedAnchor:
@@ -72,7 +79,10 @@ def _qualify_media_clock(
     Enforces that logical event.start_at + relative PTS is NOT actual capture UTC.
     Derives trigger offset only from qualified media.capture_start plus declared
     clock quality and uncertainty, or qualified explicit offset with known origin.
-    - Declared time_quality == "unknown" or "estimated" is never upgraded to "exact".
+    - Declared time_quality "unknown"/"estimated"/"device_clock" is never
+      upgraded to "exact"; recorder "host_recorded"/"provider_reported" means
+      the producer observed the wall-clock interval, not that the device clock
+      is calibrated.
     - None uncertainty is never treated as exact.
     - Camera relative PTS (clock_source == "camera_pts" or None) is never UTC.
     """
@@ -84,8 +94,10 @@ def _qualify_media_clock(
     declared_quality: str | None = None
     if raw_quality is not None and not isinstance(raw_quality, bool):
         q_str = str(raw_quality).strip().lower()
-        if q_str in ("unknown", "estimated", "exact"):
-            declared_quality = q_str
+        if q_str in ("exact", "host_recorded", "provider_reported"):
+            declared_quality = "exact"
+        elif q_str in ("estimated", "device_clock"):
+            declared_quality = "estimated"
         else:
             declared_quality = "unknown"
 
@@ -112,7 +124,7 @@ def _qualify_media_clock(
         try:
             dt_start = _ensure_utc(capture_start)
             # Must declare a trusted clock source
-            if clock_source in ("ntp", "ptp", "wall_clock"):
+            if clock_source in _TRUSTED_CLOCK_SOURCES:
                 # Declared estimated quality must NEVER be upgraded to exact
                 if declared_quality == "estimated":
                     return "estimated", dt_start
@@ -132,7 +144,7 @@ def _qualify_media_clock(
         and isinstance(start_offset, (int, float))
         and math.isfinite(start_offset)
         and event_start_at is not None
-        and clock_source in ("ntp", "ptp", "wall_clock")
+        and clock_source in _TRUSTED_CLOCK_SOURCES
     ):
         try:
             dt_origin = _ensure_utc(event_start_at) + timedelta(seconds=float(start_offset))
