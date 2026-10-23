@@ -19,14 +19,14 @@ Manual copy into `custom_components/` remains supported.
 
 > [!IMPORTANT]
 > **Version Dependency & HACS Upgrade Order:**
-> `event_vision 0.5.6` declares `event_recording` as a dependency for shared declarative validation modules, so Recording must be installed before Vision.
+> `event_vision 0.5.7` declares `event_recording` as a dependency for shared declarative validation modules, so Recording must be installed before Vision.
 > Only when both components need an upgrade in the same HACS pass, update **Event Recording** before **Event Vision**, then restart Home Assistant once.
-> For the activity-duration correction, update both Event Recording and Event Vision, then restart Home Assistant once. Existing analysis is not automatically repeated.
+> For clip-based duration and removal of AI duration fields, update both Event Recording and Event Vision, then restart Home Assistant once. Existing recordings get duration bands without reanalysis.
 
 | Component | Role | Required Dependencies | Cloud / API Key |
 |---|---|---|---|
-| **`event_recording` (0.7.17)** | Standalone event journal, media store, streaming, card | None (works standalone) | None (100% local) |
-| **`event_vision` (0.5.6)** | Optional AI incident analyzer | `event_recording` (install first) | Google Gemini API key |
+| **`event_recording` (0.7.18)** | Standalone event journal, media store, streaming, card | None (works standalone) | None (100% local) |
+| **`event_vision` (0.5.7)** | Optional AI incident analyzer | `event_recording` (install first) | Google Gemini API key |
 
 ---
 
@@ -101,7 +101,7 @@ Validate configuration and restart after this manual change. Use your actual con
 1. In Home Assistant, navigate to **Settings -> Dashboards -> Resources** (or menu dots in Lovelace UI -> Manage resources).
 2. Click **Add Resource**.
 3. Fill in the resource details:
-   - **URL:** `/event_recording/event-card.js?v=0.7.17`
+   - **URL:** `/event_recording/event-card.js?v=0.7.18`
    - **Resource Type:** `JavaScript Module`
 4. Click **Create**.
 5. You can now add the card to any Lovelace view:
@@ -111,7 +111,7 @@ Validate configuration and restart after this manual change. Use your actual con
    ```
 
 > [!TIP]
-> Keep the `?v=` suffix in sync with the installed integration version (currently `0.7.17`). Changing it after a HACS upgrade makes browsers fetch the new module instead of a cached one.
+> Keep the `?v=` suffix in sync with the installed integration version (currently `0.7.18`). Changing it after a HACS upgrade makes browsers fetch the new module instead of a cached one.
 
 ---
 

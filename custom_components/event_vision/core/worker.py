@@ -860,10 +860,6 @@ class AnalysisWorker:
                         getattr(result, "activity_details", None),
                         accumulated_frames,
                         available_media,
-                        coverage_meta,
-                        capture_state=capture_state,
-                        capture_error=getattr(event, "capture_error", None),
-                        event_coverage=getattr(event, "coverage", None),
                         version=job_details_version,
                     )
                     if result.activity is True
