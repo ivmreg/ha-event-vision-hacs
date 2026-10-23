@@ -172,18 +172,32 @@ response_variable: finalize_result
 List events with keyset pagination and server-side security filtering. Cursor strictly tracks the last consumed record.
 
 `exclude_current_complete_annotation` is evaluated before the page limit. For
-`event_vision.activity == false`, a current complete result alone is insufficient:
-Recording 0.7.8 also requires ready, error-free capture, verified or instant
-coverage with zero measured gaps and no uncertainty, available JPEG stills, and
-complete observation counts and actual frame references covering every image
-once at offset zero. Sparse video, legacy or malformed metadata, partial
-extraction, and omitted/missing inputs stay visible.
+`event_vision.activity == false`, a current complete result alone is insufficient.
+The optional `media_kinds` list selects which media policies apply and defaults
+to `["image"]` for compatibility.
+
+For `"image"`, Recording 0.7.9 requires ready, error-free capture, verified or
+instant coverage with zero measured gaps and no uncertainty, available JPEG
+stills, and complete observation counts and actual frame references covering
+every image once at offset zero. Sparse video, legacy or malformed metadata,
+partial extraction, and omitted/missing inputs stay visible.
+
+For `"video"`, the caller explicitly accepts that Event Vision sampled frames
+rather than every frame. The filter qualifies only a current complete negative
+with ready or partial capture, no capture error, available videos only, a
+complete observation plan across every clip, zero missing or unselected clips,
+and actual frame references covering every clip. Failed/interrupted captures,
+unavailable media, legacy results, stale revisions, and incomplete or partial
+sampling stay visible. This filters presentation; it does not assert that
+nothing occurred between samples.
+
 Other namespace/field/value filters retain generic JSON scalar matching.
 `exclude_journal_only` excludes only ready/expired, error-free events with no
 media records; failed captures and unavailable media remain visible.
-Grouped `event_recording/list_activity` applies the same policy to each member
-and hides a group only when every member qualifies. Authorization still governs
-all returned events; these filters never delete journal or media data.
+Grouped `event_recording/list_activity` applies the same media-kind policy to
+each member and hides a group only when every member qualifies. Authorization
+still governs all returned events; these filters never delete journal or media
+data.
 
 ```json
 // Request
@@ -197,7 +211,8 @@ all returned events; these filters never delete journal or media data.
   "exclude_current_complete_annotation": {
     "namespace": "event_vision",
     "field": "activity",
-    "equals": false
+    "equals": false,
+    "media_kinds": ["image"]
   },
   "exclude_journal_only": true
 }

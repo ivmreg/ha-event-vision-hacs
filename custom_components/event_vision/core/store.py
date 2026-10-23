@@ -48,7 +48,7 @@ class AnalysisJobStore:
             order_by_sql="is_manual DESC, id ASC",
             extra_index_cols=(),
             recover_on_lease=False,
-            increment_attempts_on_lease_expiry=False,
+            increment_attempts_on_lease_expiry=True,
         )
         self._engine = DurableQueueEngine(
             db_path=db_path,
@@ -272,9 +272,19 @@ class AnalysisJobStore:
             claim_token=effective_token,
         )
 
-    async def recover_expired_leases(self, force_all: bool = False) -> int:
-        """Recover expired or in-flight leases preserving attempt counts."""
-        return await self._engine.recover_expired_leases(force_all=force_all)
+    async def recover_expired_leases(
+        self,
+        force_all: bool = False,
+        *,
+        exclude_job_ids: tuple[int, ...] = (),
+        limit: int | None = None,
+    ) -> int:
+        """Recover abandoned claims; runtime expiry consumes a bounded attempt."""
+        return await self._engine.recover_expired_leases(
+            force_all=force_all,
+            exclude_job_ids=exclude_job_ids,
+            limit=limit,
+        )
 
     async def get_stats(self) -> dict[str, int]:
         """Get aggregate counts of jobs by status."""

@@ -20,6 +20,7 @@ import asyncio
 import logging
 import math
 import random
+from collections.abc import Awaitable
 from dataclasses import replace
 from datetime import timedelta
 from typing import Any
@@ -51,6 +52,7 @@ from ..const import (
     STATUS_SKIPPED,
     VALID_SAMPLING_POLICIES,
 )
+from .activity_details import build_activity_details
 from .cache import FrameCache
 from .extractor import FrameExtractor
 from .fusion_store import FusionJobStore
@@ -82,6 +84,28 @@ from .sampling import plan_event_sampling
 from .store import AnalysisJobStore
 
 _LOGGER = logging.getLogger(__name__)
+
+
+async def _settled_operation(operation: Awaitable[Any]) -> Any:
+    """Keep ownership until a critical asynchronous mutation physically settles.
+
+    Cancelling an awaiter does not stop a recorder's SQLite executor thread.
+    Drain that operation before allowing runtime recovery to reuse the claim.
+    """
+    task = asyncio.ensure_future(operation)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    if cancelled:
+        if not task.cancelled():
+            task.exception()  # Retrieve a failure even when cancellation wins.
+        raise asyncio.CancelledError
+    return task.result()
 
 
 def is_retryable_provider_error(err: Exception) -> bool:
@@ -222,6 +246,8 @@ class AnalysisWorker:
         self._wake_event = asyncio.Event()
         self._semaphore = asyncio.Semaphore(max(1, min(concurrency, 4)))
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._claim_lock = asyncio.Lock()
+        self._event_claims: dict[asyncio.Task[None], AnalysisJob] = {}
         self._prefer_fusion = False
         self.event_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self.incident_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
@@ -351,6 +377,19 @@ class AnalysisWorker:
 
     async def process_next_job(self) -> bool:
         """Attempt to lease and execute one eligible job with bounded concurrency."""
+        async with self._claim_lock:
+            # Repair even while cooldown/slots/recorder availability block new work.
+            # Owners remain protected through deadline cancellation and cleanup.
+            await _settled_operation(
+                self._job_store.recover_expired_leases(
+                    exclude_job_ids=tuple({job.id for job in self._event_claims.values()}),
+                    limit=50,
+                )
+            )
+            return await self._claim_next_job()
+
+    async def _claim_next_job(self) -> bool:
+        """Lease and register ownership under the same admission lock as repair."""
         if not self._rec_api.is_open:
             return False
         if self._semaphore.locked():
@@ -387,7 +426,9 @@ class AnalysisWorker:
                     execute = self._guarded_execute_fusion if fusion else self._guarded_execute
                     task = asyncio.create_task(execute(job))
                     self._background_tasks.add(task)
-                    task.add_done_callback(self._background_tasks.discard)
+                    if not fusion:
+                        self._event_claims[task] = job
+                    task.add_done_callback(self._claim_finished)
                     return True
 
             self._semaphore.release()
@@ -398,6 +439,30 @@ class AnalysisWorker:
                 self._semaphore.release()
             raise
 
+    def _claim_finished(self, task: asyncio.Task[None]) -> None:
+        self._background_tasks.discard(task)
+        self._event_claims.pop(task, None)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            _LOGGER.error("Analysis task exited: %s", sanitize_error_code(error))
+
+    async def _settle_unfinished_claim(self, job: AnalysisJob, cancelled: bool) -> None:
+        """A normal early exit must not leave a valid lease without an owner."""
+        try:
+            if cancelled or not self._rec_api.is_open:
+                await self._job_store.defer_job(job.id, job.generation, claim_token=job.claim_token)
+            else:
+                await self._job_store.fail_job(
+                    job.id,
+                    job.generation,
+                    "WORKER_EXITED",
+                    retryable=True,
+                    backoff_seconds=compute_retry_delay(job.attempts),
+                    claim_token=job.claim_token,
+                )
+        except Exception as err:
+            # Leave the durable lease for the next bounded repair pass.
+            _LOGGER.warning("Analysis claim settlement deferred: %s", sanitize_error_code(err))
+
     async def _guarded_execute(self, job: AnalysisJob) -> None:
         await self._run_claimed(job, fusion=False)
 
@@ -406,6 +471,7 @@ class AnalysisWorker:
         execute = self._execute_fusion_job if fusion else self._execute_job
         failure = self._handle_fusion_job_failure if fusion else self._handle_job_failure
         deadline = self._fusion_job_deadline if fusion else self._job_deadline
+        cancelled = False
         if job.profile_payload:
             try:
                 deadline = load_profile(
@@ -427,11 +493,18 @@ class AnalysisWorker:
                     ),
                 )
             except asyncio.CancelledError:
+                cancelled = True
                 raise  # Durable claims remain recoverable; input cleanup runs inside execute.
             except Exception as err:
                 await failure(job, err)
+        except Exception as err:
+            _LOGGER.error("Analysis failure persistence deferred: %s", sanitize_error_code(err))
         finally:
-            self._semaphore.release()
+            try:
+                if not fusion:
+                    await _settled_operation(self._settle_unfinished_claim(job, cancelled))
+            finally:
+                self._semaphore.release()
 
     async def _execute_job(self, job: AnalysisJob) -> None:
         """Execute single analysis job with derived media lease pin and CAS protection."""
@@ -475,12 +548,14 @@ class AnalysisWorker:
                         job.id, job.generation, claim_token=job.claim_token
                     )
                     return
-                annotation_gen = await self._rec_api.reserve_annotation(
-                    event_id=job.event_id,
-                    namespace=ANNOTATION_NAMESPACE,
-                    expected_media_revision=job.media_revision,
-                    worker_id=self._worker_id,
-                    ttl_seconds=res_ttl,
+                annotation_gen = await _settled_operation(
+                    self._rec_api.reserve_annotation(
+                        event_id=job.event_id,
+                        namespace=ANNOTATION_NAMESPACE,
+                        expected_media_revision=job.media_revision,
+                        worker_id=self._worker_id,
+                        ttl_seconds=res_ttl,
+                    )
                 )
                 if annotation_gen is None:
                     await self._job_store.supersede_job(
@@ -497,13 +572,15 @@ class AnalysisWorker:
                         job.id, job.generation, claim_token=job.claim_token
                     )
                     return
-                renewed = await self._rec_api.renew_annotation_reservation(
-                    event_id=job.event_id,
-                    namespace=ANNOTATION_NAMESPACE,
-                    expected_media_revision=job.media_revision,
-                    expected_generation=annotation_gen,
-                    worker_id=self._worker_id,
-                    ttl_seconds=res_ttl,
+                renewed = await _settled_operation(
+                    self._rec_api.renew_annotation_reservation(
+                        event_id=job.event_id,
+                        namespace=ANNOTATION_NAMESPACE,
+                        expected_media_revision=job.media_revision,
+                        expected_generation=annotation_gen,
+                        worker_id=self._worker_id,
+                        ttl_seconds=res_ttl,
+                    )
                 )
                 if not renewed:
                     await self._job_store.supersede_job(
@@ -550,6 +627,7 @@ class AnalysisWorker:
         job_base_prompt = semantic_profile["base_prompt"]
         job_max_frames = semantic_profile["max_frames"]
         job_policy = semantic_profile["sampling_policy"]
+        job_details_version = semantic_profile.get("activity_details_version", 0)
 
         job_deadline = budget["job_deadline"]
         job_provider_timeout = budget["provider_timeout"]
@@ -596,12 +674,14 @@ class AnalysisWorker:
                     model=job_model,
                     updated_at=format_iso(utc_now()),
                 )
-                if not await self._rec_api.set_annotation_cas(
-                    event_id=job.event_id,
-                    expected_media_revision=job.media_revision,
-                    namespace=ANNOTATION_NAMESPACE,
-                    payload=proc_annotation.to_dict(),
-                    expected_generation=annotation_gen,
+                if not await _settled_operation(
+                    self._rec_api.set_annotation_cas(
+                        event_id=job.event_id,
+                        expected_media_revision=job.media_revision,
+                        namespace=ANNOTATION_NAMESPACE,
+                        payload=proc_annotation.to_dict(),
+                        expected_generation=annotation_gen,
+                    )
                 ):
                     return
 
@@ -633,12 +713,14 @@ class AnalysisWorker:
                     model=self._gemini.model,
                     updated_at=format_iso(utc_now()),
                 )
-                await self._rec_api.set_annotation_cas(
-                    event_id=job.event_id,
-                    expected_media_revision=job.media_revision,
-                    namespace=ANNOTATION_NAMESPACE,
-                    payload=skip_annotation.to_dict(),
-                    expected_generation=annotation_gen,
+                await _settled_operation(
+                    self._rec_api.set_annotation_cas(
+                        event_id=job.event_id,
+                        expected_media_revision=job.media_revision,
+                        namespace=ANNOTATION_NAMESPACE,
+                        payload=skip_annotation.to_dict(),
+                        expected_generation=annotation_gen,
+                    )
                 )
                 await self._job_store.skip_job(
                     job.id, job.generation, "MEDIA_UNAVAILABLE", claim_token=job.claim_token
@@ -731,12 +813,16 @@ class AnalysisWorker:
             )
 
             # 6. Call direct Gemini REST generateContent
+            details_options = (
+                {"activity_details_version": job_details_version} if job_details_version else {}
+            )
             result = await self._gemini.generate_analysis(
                 frames=accumulated_frames,
                 prompt_instructions=job_instructions,
                 timeout_seconds=job_provider_timeout,
                 model=job_model,
                 base_prompt=job_base_prompt,
+                **details_options,
             )
 
             # 7. Post CAS complete state with frame provenance and returned modelVersion
@@ -769,14 +855,30 @@ class AnalysisWorker:
                 updated_at=format_iso(utc_now()),
                 frames=frames_provenance,
                 coverage=coverage_meta,
+                activity_details=(
+                    build_activity_details(
+                        getattr(result, "activity_details", None),
+                        accumulated_frames,
+                        available_media,
+                        coverage_meta,
+                        capture_state=capture_state,
+                        capture_error=getattr(event, "capture_error", None),
+                        event_coverage=getattr(event, "coverage", None),
+                        version=job_details_version,
+                    )
+                    if result.activity is True
+                    else None
+                ),
             )
 
-            committed = await self._rec_api.set_annotation_cas(
-                event_id=job.event_id,
-                expected_media_revision=job.media_revision,
-                namespace=ANNOTATION_NAMESPACE,
-                payload=complete_annotation.to_dict(),
-                expected_generation=annotation_gen,
+            committed = await _settled_operation(
+                self._rec_api.set_annotation_cas(
+                    event_id=job.event_id,
+                    expected_media_revision=job.media_revision,
+                    namespace=ANNOTATION_NAMESPACE,
+                    payload=complete_annotation.to_dict(),
+                    expected_generation=annotation_gen,
+                )
             )
 
             if committed:
@@ -956,12 +1058,14 @@ class AnalysisWorker:
                     )
                     posted = False
                     try:
-                        posted = await self._rec_api.set_annotation_cas(
-                            event_id=job.event_id,
-                            expected_media_revision=job.media_revision,
-                            namespace=ANNOTATION_NAMESPACE,
-                            payload=fail_ann.to_dict(),
-                            expected_generation=claimed_gen,
+                        posted = await _settled_operation(
+                            self._rec_api.set_annotation_cas(
+                                event_id=job.event_id,
+                                expected_media_revision=job.media_revision,
+                                namespace=ANNOTATION_NAMESPACE,
+                                payload=fail_ann.to_dict(),
+                                expected_generation=claimed_gen,
+                            )
                         )
                     except Exception:
                         posted = False

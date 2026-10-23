@@ -119,6 +119,10 @@ class VisionCoordinator:
     @property
     def profile_payload(self) -> str:
         """Return canonical JSON profile payload with semantic and operational budget snapshot."""
+        return self._event_profile_payload(activity_details_version=1)
+
+    def _event_profile_payload(self, activity_details_version: int = 0) -> str:
+        """Build the new-job or explicitly legacy migration snapshot."""
         payload = build_job_payload(
             model=self.model,
             instructions=self.prompt_instructions,
@@ -129,17 +133,23 @@ class VisionCoordinator:
             provider_timeout=self.provider_timeout,
             extraction_timeout=self.extraction_timeout,
             max_attempts=self.max_attempts,
+            activity_details_version=activity_details_version,
         )
         return canonical_profile_json(payload)
 
     @property
     def profile_digest(self) -> str:
         """Return profile digest including all actual semantic sampling and analysis settings."""
+        return self._event_profile_digest(activity_details_version=1)
+
+    def _event_profile_digest(self, activity_details_version: int = 0) -> str:
+        """Keep snapshot-less legacy migration separate from enriched new jobs."""
         return compute_profile_digest(
             model=self.model,
             instructions=self.prompt_instructions,
             max_frames=self.max_frames,
             sampling_policy=self.sampling_policy,
+            activity_details_version=activity_details_version,
         )
 
     @property
@@ -257,9 +267,11 @@ class VisionCoordinator:
 
     async def async_startup(self) -> None:
         """Initialize worker and run startup catchup scan if auto_analyze is enabled."""
+        # Older jobs without snapshots follow their existing legacy migration;
+        # upgrading the integration must not opt those jobs into new enrichment.
         await self.job_store.migrate_legacy_pending_jobs(
-            profile_digest=self.profile_digest,
-            profile_payload=self.profile_payload,
+            profile_digest=self._event_profile_digest(),
+            profile_payload=self._event_profile_payload(),
         )
         self.worker.start()
 

@@ -64,6 +64,7 @@ from ..const import (
     VALID_SAMPLING_POLICIES,
     VALID_STATUSES,
 )
+from .activity_details import ActivityDetailsRaw, sanitize_activity_details
 
 # Canonical shared declarative specifications for Event Vision
 SPEC_CONCURRENCY = NumberSpec(
@@ -172,9 +173,14 @@ def build_profile_payload(
     sampling_policy: str = DEFAULT_SAMPLING_POLICY,
     base_prompt: str = GENERIC_MEDIA_PROMPT,
     policy_version: int = PROFILE_POLICY_VERSION,
+    activity_details_version: int = 0,
 ) -> dict[str, Any]:
-    """Build canonical dictionary of effective semantic configuration."""
-    return {
+    """Build canonical dictionary of effective semantic configuration.
+
+    Legacy profiles omit ``activity_details_version`` entirely so their
+    canonical JSON and digest remain byte-equivalent.
+    """
+    payload: dict[str, Any] = {
         "base_prompt": (base_prompt or GENERIC_MEDIA_PROMPT).strip(),
         "instructions": (instructions or "").strip(),
         "max_frames": int(max_frames),
@@ -182,6 +188,9 @@ def build_profile_payload(
         "policy_version": int(policy_version),
         "sampling_policy": (sampling_policy or DEFAULT_SAMPLING_POLICY).strip(),
     }
+    if activity_details_version:
+        payload["activity_details_version"] = int(activity_details_version)
+    return payload
 
 
 def canonical_profile_json(payload: dict[str, Any]) -> str:
@@ -196,6 +205,7 @@ def compute_profile_digest(
     sampling_policy: str = DEFAULT_SAMPLING_POLICY,
     base_prompt: str = GENERIC_MEDIA_PROMPT,
     policy_version: int = PROFILE_POLICY_VERSION,
+    activity_details_version: int = 0,
 ) -> str:
     """Compute deterministic cryptographic digest from canonical sorted JSON."""
     payload = build_profile_payload(
@@ -205,6 +215,7 @@ def compute_profile_digest(
         sampling_policy=sampling_policy,
         base_prompt=base_prompt,
         policy_version=policy_version,
+        activity_details_version=activity_details_version,
     )
     raw = canonical_profile_json(payload).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:16]
@@ -221,6 +232,7 @@ def build_job_payload(
     provider_timeout: float = DEFAULT_PROVIDER_TIMEOUT,
     extraction_timeout: float = DEFAULT_EXTRACTION_TIMEOUT,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    activity_details_version: int = 0,
 ) -> dict[str, Any]:
     """Build complete durable job execution snapshot including operational budget."""
     semantic = build_profile_payload(
@@ -230,6 +242,7 @@ def build_job_payload(
         sampling_policy=sampling_policy,
         base_prompt=base_prompt,
         policy_version=policy_version,
+        activity_details_version=activity_details_version,
     )
     return {
         **semantic,
@@ -319,6 +332,13 @@ def validate_profile_payload(
         "policy_version": p_ver,
         "sampling_policy": sampling_policy,
     }
+    if "activity_details_version" in data:
+        details_version = data["activity_details_version"]
+        if type(details_version) is not int or details_version not in (0, 1):
+            raise AnalysisError(
+                "INVALID_PROFILE", "Unsupported activity_details_version", retryable=False
+            )
+        semantic_dict["activity_details_version"] = details_version
 
     # 3. Digest verification if requested
     if expected_digest:
@@ -810,6 +830,7 @@ class AnalysisResult:
     activity: bool
     objects: list[str] = field(default_factory=list)
     model_version: str | None = None
+    activity_details: ActivityDetailsRaw | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.summary, str):
@@ -853,6 +874,7 @@ class AnalysisAnnotation:
     updated_at: str | None = None
     frames: list[dict[str, Any]] | None = None
     coverage: ObservationCoverage | dict[str, Any] | None = None
+    activity_details: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.status not in VALID_STATUSES:
@@ -901,6 +923,10 @@ class AnalysisAnnotation:
         if self.coverage is not None:
             assert isinstance(self.coverage, ObservationCoverage)
             payload["coverage"] = self.coverage.to_dict()
+        if self.status == "complete" and self.activity is True:
+            details = sanitize_activity_details(self.activity_details)
+            if details is not None:
+                payload["activity_details"] = details
         return payload
 
     @classmethod
@@ -929,6 +955,7 @@ class AnalysisAnnotation:
             updated_at=data.get("updated_at"),
             frames=data.get("frames"),
             coverage=cov_obj,
+            activity_details=sanitize_activity_details(data.get("activity_details")),
         )
 
 

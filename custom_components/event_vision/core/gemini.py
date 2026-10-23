@@ -36,6 +36,11 @@ from ..const import (
     MAX_RETRY_AFTER_SECONDS,
     MAX_SUMMARY_LEN,
 )
+from .activity_details import (
+    ACTIVITY_DETAILS_PROMPT,
+    activity_details_schema,
+    parse_activity_details,
+)
 from .models import (
     AnalysisError,
     AnalysisResult,
@@ -198,6 +203,7 @@ class GeminiClient:
         timeout_seconds: float = 60.0,
         model: str | None = None,
         base_prompt: str | None = None,
+        activity_details_version: int = 0,
     ) -> AnalysisResult:
         """Call Gemini REST generateContent with media frames and structured JSON output."""
         if not frames:
@@ -211,8 +217,15 @@ class GeminiClient:
         else:
             prompt_text = effective_base
 
+        enriched = type(activity_details_version) is int and activity_details_version == 1
+        if enriched:
+            prompt_text = f"{prompt_text}\n{ACTIVITY_DETAILS_PROMPT}"
         parts: list[dict[str, Any]] = [{"text": prompt_text}]
-        for frame in frames:
+        media_groups: dict[str | None, int] = {}
+        for index, frame in enumerate(frames):
+            if enriched:
+                group = media_groups.setdefault(frame.media_id, len(media_groups) + 1)
+                parts.append({"text": f"Frame F{index + 1}, media group G{group}."})
             b64_data = base64.b64encode(frame.data).decode("ascii")
             parts.append(
                 {
@@ -242,8 +255,14 @@ class GeminiClient:
             },
         }
 
+        if enriched:
+            payload["generationConfig"]["response_schema"]["properties"]["activity_details"] = (
+                activity_details_schema()
+            )
         raw_json = await self._request(payload, timeout_seconds, model)
-        return self._parse_and_validate_response(raw_json)
+        return self._parse_and_validate_response(
+            raw_json, valid_frame_refs={f"F{i + 1}" for i in range(len(frames))} if enriched else None
+        )
 
     async def _request(
         self, payload: dict[str, Any], timeout_seconds: float, model: str | None
@@ -326,7 +345,9 @@ class GeminiClient:
                 "NETWORK_ERROR", "Network error connecting to Gemini", retryable=True
             ) from err
 
-    def _parse_and_validate_response(self, raw_resp: dict[str, Any]) -> AnalysisResult:
+    def _parse_and_validate_response(
+        self, raw_resp: dict[str, Any], *, valid_frame_refs: set[str] | None = None
+    ) -> AnalysisResult:
         """Validate structure and fields of the Gemini JSON response."""
         try:
             model_version = raw_resp.get("modelVersion")
@@ -382,6 +403,11 @@ class GeminiClient:
                 activity=activity,
                 objects=objects,
                 model_version=str(model_version).strip() if model_version else None,
+                activity_details=(
+                    parse_activity_details(data.get("activity_details"), valid_frame_refs)
+                    if activity and valid_frame_refs is not None
+                    else None
+                ),
             )
         except json.JSONDecodeError as err:
             raise GeminiSchemaError(

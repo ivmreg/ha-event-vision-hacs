@@ -859,11 +859,31 @@ class DurableQueueEngine:
     def _sync_supersede(self, job_id: int, generation: int, claim_token: str | None = None) -> bool:
         return self._sync_transition(job_id, generation, claim_token, "superseded")
 
-    async def recover_expired_leases(self, force_all: bool = False, commit: bool = True) -> int:
-        """Recover expired or in-flight leases, resetting claim tokens and preserving attempts."""
-        return await asyncio.to_thread(self._sync_recover_expired_leases, force_all, commit)
+    async def recover_expired_leases(
+        self,
+        force_all: bool = False,
+        commit: bool = True,
+        *,
+        exclude_job_ids: tuple[int, ...] = (),
+        limit: int | None = None,
+    ) -> int:
+        """Recover claims with policy-specific expiry accounting; startup preserves attempts."""
+        return await asyncio.to_thread(
+            self._sync_recover_expired_leases,
+            force_all,
+            commit,
+            exclude_job_ids=exclude_job_ids,
+            limit=limit,
+        )
 
-    def _sync_recover_expired_leases(self, force_all: bool = False, commit: bool = True) -> int:
+    def _sync_recover_expired_leases(
+        self,
+        force_all: bool = False,
+        commit: bool = True,
+        *,
+        exclude_job_ids: tuple[int, ...] = (),
+        limit: int | None = None,
+    ) -> int:
         now_dt = utc_now()
         now_str = format_iso(now_dt) or ""
 
@@ -873,16 +893,25 @@ class DurableQueueEngine:
             if commit:
                 cur.execute("BEGIN IMMEDIATE;")
             try:
-                if force_all:
-                    cur.execute(f"SELECT * FROM {self._spec.table_name} WHERE status = 'leased';")
-                else:
-                    cur.execute(
-                        f"""
-                        SELECT * FROM {self._spec.table_name}
-                        WHERE status = 'leased' AND (leased_until IS NULL OR leased_until <= ?);
-                        """,
-                        (now_str,),
-                    )
+                clauses = ["status = 'leased'"]
+                params: list[Any] = []
+                if not force_all:
+                    clauses.append("(leased_until IS NULL OR leased_until <= ?)")
+                    params.append(now_str)
+                if exclude_job_ids:
+                    clauses.append(f"id NOT IN ({','.join('?' for _ in exclude_job_ids)})")
+                    params.extend(exclude_job_ids)
+                sql = f"SELECT * FROM {self._spec.table_name} WHERE {' AND '.join(clauses)} ORDER BY id"
+                if limit is not None:
+                    if (
+                        isinstance(limit, bool)
+                        or not isinstance(limit, int)
+                        or not 1 <= limit <= 1000
+                    ):
+                        raise ValueError("recovery limit must be an integer from 1 to 1000")
+                    sql += " LIMIT ?"
+                    params.append(limit)
+                cur.execute(sql, params)
                 expired = cur.fetchall()
                 recovered_count = 0
 
