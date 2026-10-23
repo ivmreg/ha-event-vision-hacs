@@ -19,14 +19,14 @@ Manual copy into `custom_components/` remains supported.
 
 > [!IMPORTANT]
 > **Version Dependency & HACS Upgrade Order:**
-> `event_vision 0.5.4` declares `event_recording` as a dependency for shared declarative validation modules, so Recording must be installed before Vision.
+> `event_vision 0.5.5` declares `event_recording` as a dependency for shared declarative validation modules, so Recording must be installed before Vision.
 > Only when both components need an upgrade in the same HACS pass, update **Event Recording** before **Event Vision**, then restart Home Assistant once.
 > A Recording-only update such as the 0.7.13 activity-filter fix needs no Event Vision reinstall and no analyzer changes; existing Event Vision installations keep working unchanged.
 
 | Component | Role | Required Dependencies | Cloud / API Key |
 |---|---|---|---|
-| **`event_recording` (0.7.14)** | Standalone event journal, media store, streaming, card | None (works standalone) | None (100% local) |
-| **`event_vision` (0.5.4)** | Optional AI incident analyzer | `event_recording` (install first) | Google Gemini API key |
+| **`event_recording` (0.7.15)** | Standalone event journal, media store, streaming, card | None (works standalone) | None (100% local) |
+| **`event_vision` (0.5.5)** | Optional AI incident analyzer | `event_recording` (install first) | Google Gemini API key |
 
 ---
 
@@ -101,7 +101,7 @@ Validate configuration and restart after this manual change. Use your actual con
 1. In Home Assistant, navigate to **Settings -> Dashboards -> Resources** (or menu dots in Lovelace UI -> Manage resources).
 2. Click **Add Resource**.
 3. Fill in the resource details:
-   - **URL:** `/event_recording/event-card.js?v=0.7.14`
+   - **URL:** `/event_recording/event-card.js?v=0.7.15`
    - **Resource Type:** `JavaScript Module`
 4. Click **Create**.
 5. You can now add the card to any Lovelace view:
@@ -111,7 +111,7 @@ Validate configuration and restart after this manual change. Use your actual con
    ```
 
 > [!TIP]
-> Keep the `?v=` suffix in sync with the installed integration version (currently `0.7.14`). Changing it after a HACS upgrade makes browsers fetch the new module instead of a cached one.
+> Keep the `?v=` suffix in sync with the installed integration version (currently `0.7.15`). Changing it after a HACS upgrade makes browsers fetch the new module instead of a cached one.
 
 ---
 

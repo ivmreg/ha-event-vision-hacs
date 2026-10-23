@@ -27,6 +27,15 @@ _TIMING_QUALITIES = frozenset({"exact", "estimated"})
 _ALLOWED_CONTINUITIES = frozenset(
     {"verified_segments", "contiguous", "continuous", "provider_verified"}
 )
+#: Capture states whose media can still carry a trustworthy intra-clip window.
+#: ``partial`` only means the requested window was not fully covered; the
+#: duration evidence itself is checked separately (observation, continuity, gaps).
+_TRUSTED_CAPTURE_STATES = frozenset({"ready", "partial"})
+#: Coverage gaps below this are segment/frame-boundary noise. The recorder
+#: tolerates sub-second shortfalls itself and the card treats under 2s as timing
+#: noise (frontend/src/coverage.js), so a healthy recording must not lose its
+#: duration estimate over one.
+MAX_TOLERATED_COVERAGE_GAP_SECONDS = 2.0
 _UNKNOWN_DURATION: dict[str, Any] = {"band": "unknown", "estimated": False}
 
 ACTIVITY_DETAILS_PROMPT = """Optionally add activity_details for visible activity: a factual
@@ -35,8 +44,10 @@ and up to four moments with a short label and a supplied frame_ref such as F2.
 Use delivery or child only when clearly supported; otherwise person or unknown. Do not identify people.
 Only describe visible facts. Never invent arrivals, departures, activity endings, times or media IDs.
 For one unambiguous episode you may return window with single_episode=true and frame references
-before_inactive, first_active, last_active, after_inactive, only when all four observations exist
-in the same media group. Omit window if boundaries, continuity, or episode count are uncertain.
+first_active, last_active and after_inactive, only when all three observations exist in the same
+media group. Add before_inactive only when a supplied frame shows the scene before the activity
+began; omit it when the activity is already in progress in the first frame. Omit window if
+boundaries, continuity, or episode count are uncertain.
 Media groups are separate recordings; their concatenation does not imply chronological continuity.
 Do not estimate seconds or substitute recording length. Omit unsupported fields. activity=false
 must not include positive activity_details. Existing summary and activity remain required."""
@@ -82,10 +93,10 @@ def activity_details_schema() -> dict[str, Any]:
 class ActivityWindowRefs:
     """Locally resolvable frame labels for one candidate activity window."""
 
-    before_inactive: str
     first_active: str
     last_active: str
     after_inactive: str
+    before_inactive: str | None = None
 
 
 @dataclass(frozen=True)
@@ -169,12 +180,14 @@ def parse_activity_details(
             first = _clean_ref(raw_window.get("first_active"), valid_refs)
             last = _clean_ref(raw_window.get("last_active"), valid_refs)
             after = _clean_ref(raw_window.get("after_inactive"), valid_refs)
-            if all((before, first, last, after)):
+            # before_inactive is optional: a recording that starts with the
+            # activity already in progress has no inactive frame before it.
+            if all((first, last, after)):
                 window = ActivityWindowRefs(
-                    before_inactive=before,
                     first_active=first,
                     last_active=last,
                     after_inactive=after,
+                    before_inactive=before,
                 )
 
         moments: list[ActivityMomentRef] = []
@@ -236,7 +249,9 @@ def _sanitize_persisted_duration(raw: Any) -> dict[str, Any]:
     if media_id is None or any(value is None for value in offsets):
         return dict(_UNKNOWN_DURATION)
     assert before is not None and first is not None and last is not None and after is not None
-    if not (0.0 <= before < first <= last < after):
+    # A persisted 0.0 before-offset means "activity already in progress when the
+    # footage starts", so it may coincide with the first active offset.
+    if not (0.0 <= before <= first <= last < after):
         return dict(_UNKNOWN_DURATION)
     lower, upper = last - first, after - before
     expected_band = (
@@ -380,20 +395,32 @@ def _duration_band(
     coverage: Any,
     capture_state: str | None,
 ) -> dict[str, Any]:
+    """Derive a duration band from resolved frame offsets.
+
+    ``before_inactive`` is optional. When the recording starts with the activity
+    already in progress there is no inactive frame to prove when it began, so the
+    first footage frame (offset 0) is used as the earliest bound. The band then
+    only claims what the footage actually shows: the activity had ended by
+    ``after_inactive`` and the observed episode is bounded by the clip start.
+    """
     unknown = dict(_UNKNOWN_DURATION)
-    if not _coverage_supports_duration(coverage) or capture_state != "ready":
+    if not _coverage_supports_duration(coverage) or capture_state not in _TRUSTED_CAPTURE_STATES:
         return unknown
 
-    refs = (
-        window.before_inactive,
-        window.first_active,
-        window.last_active,
-        window.after_inactive,
+    first = frame_by_ref.get(window.first_active)
+    last = frame_by_ref.get(window.last_active)
+    after = frame_by_ref.get(window.after_inactive)
+    before = (
+        frame_by_ref.get(window.before_inactive)
+        if window.before_inactive is not None
+        else None
     )
-    frames = [frame_by_ref.get(ref) for ref in refs]
-    if any(frame is None for frame in frames):
+    if first is None or last is None or after is None:
+        return unknown
+    if window.before_inactive is not None and before is None:
         return unknown
 
+    frames = [frame for frame in (before, first, last, after) if frame is not None]
     media_ids = {_attr(frame, "media_id") for frame in frames}
     if None in media_ids or len(media_ids) != 1:
         return unknown
@@ -410,8 +437,15 @@ def _duration_band(
     if duration is None or duration <= 0.0:
         return unknown
 
-    offsets: list[float] = []
-    for frame in frames:
+    offsets: dict[str, float] = {}
+    for name, frame in (
+        ("before", before),
+        ("first", first),
+        ("last", last),
+        ("after", after),
+    ):
+        if frame is None:
+            continue
         if _attr(frame, "timestamp_quality") not in _TIMING_QUALITIES:
             return unknown
         if _attr(frame, "offset_quality") not in _TIMING_QUALITIES:
@@ -419,14 +453,20 @@ def _duration_band(
         offset = _frame_offset(frame, duration)
         if offset is None:
             return unknown
-        offsets.append(offset)
+        offsets[name] = offset
 
-    before, first, last, after = offsets
-    if not (before < first <= last < after):
+    before_offset = offsets.get("before", 0.0)
+    first_offset = offsets["first"]
+    last_offset = offsets["last"]
+    after_offset = offsets["after"]
+    if "before" in offsets:
+        if not (before_offset < first_offset <= last_offset < after_offset):
+            return unknown
+    elif not (0.0 <= first_offset <= last_offset < after_offset):
         return unknown
 
-    lower = last - first
-    upper = after - before
+    lower = last_offset - first_offset
+    upper = after_offset - before_offset
     if upper < 30.0:
         band = "short"
     elif lower >= 30.0 and upper <= 60.0:
@@ -441,10 +481,10 @@ def _duration_band(
         "estimated": True,
         "evidence": {
             "media_id": media_id,
-            "before_inactive_offset": before,
-            "first_active_offset": first,
-            "last_active_offset": last,
-            "after_inactive_offset": after,
+            "before_inactive_offset": before_offset,
+            "first_active_offset": first_offset,
+            "last_active_offset": last_offset,
+            "after_inactive_offset": after_offset,
         },
     }
 
@@ -547,9 +587,14 @@ def build_activity_details(
         gap_free = True
         if isinstance(event_coverage, Mapping):
             for key in ("gaps", "gap_seconds"):
-                gap = _finite_float(event_coverage.get(key, 0))
-                if gap is None or gap != 0:
+                if key not in event_coverage:
+                    continue
+                gap = _finite_float(event_coverage.get(key))
+                # A missing measurement stays unknown; only a real gap of two
+                # seconds or more disqualifies the window.
+                if gap is None or gap >= MAX_TOLERATED_COVERAGE_GAP_SECONDS:
                     gap_free = False
+                    break
         if raw.window is not None and not capture_error and gap_free:
             result["duration"] = _duration_band(
                 raw.window, frame_by_ref, media_by_id, coverage, capture_state
